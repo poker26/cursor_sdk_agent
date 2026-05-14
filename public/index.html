@@ -84,6 +84,11 @@
         logElement.scrollTop = logElement.scrollHeight;
       }
 
+      function appendAssistantTextChunk(chunkText) {
+        logElement.textContent += chunkText;
+        logElement.scrollTop = logElement.scrollHeight;
+      }
+
       async function postChatStream() {
         const messageText = inputElement.value.trim();
         if (!messageText) {
@@ -92,7 +97,8 @@
         }
         sendButton.disabled = true;
         resetButton.disabled = true;
-        appendLogLine("\n---\n> " + messageText + "\n");
+        appendLogLine("\n---\n> " + messageText);
+        let assistantHeadingWritten = false;
         inputElement.value = "";
 
         const fetchResponse = await fetch("/api/chat", {
@@ -128,15 +134,33 @@
               try {
                 const parsedPayload = JSON.parse(jsonPayloadText);
                 if (parsedPayload.kind === "assistant_text") {
-                  appendLogLine(parsedPayload.text);
+                  if (!assistantHeadingWritten) {
+                    appendLogLine("");
+                    appendLogLine("Агент:");
+                    assistantHeadingWritten = true;
+                  }
+                  appendAssistantTextChunk(parsedPayload.text);
                 } else if (parsedPayload.kind === "run_finished") {
+                  appendLogLine("");
                   appendLogLine(
-                    "\n[готово] status=" +
+                    "[готово] status=" +
                       parsedPayload.status +
                       (parsedPayload.runId ? " runId=" + parsedPayload.runId : "")
                   );
                 } else if (parsedPayload.kind === "error") {
                   appendLogLine("[ошибка] " + parsedPayload.message);
+                } else if (parsedPayload.kind === "status") {
+                  if (parsedPayload.status === "ERROR") {
+                    appendLogLine(
+                      "[статус] " + parsedPayload.status + (parsedPayload.message ? " " + parsedPayload.message : "")
+                    );
+                  }
+                } else if (parsedPayload.kind === "thinking") {
+                  /* служебный поток, в лог не выводим */
+                } else if (parsedPayload.kind === "tool_call") {
+                  if (parsedPayload.status === "error") {
+                    appendLogLine("[инструмент] " + parsedPayload.name + " — ошибка");
+                  }
                 } else {
                   appendLogLine("[событие] " + jsonPayloadText);
                 }
