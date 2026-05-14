@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cursor SDK — чат</title>
+    <style>
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #e8e8e8;
+        background: #121212;
+      }
+      body {
+        margin: 0 auto;
+        max-width: 52rem;
+        padding: 1rem;
+      }
+      h1 {
+        font-size: 1.1rem;
+        font-weight: 600;
+      }
+      #log {
+        white-space: pre-wrap;
+        min-height: 12rem;
+        border: 1px solid #333;
+        border-radius: 6px;
+        padding: 0.75rem;
+        margin: 0.75rem 0;
+        background: #1a1a1a;
+        font-size: 0.9rem;
+        line-height: 1.45;
+      }
+      textarea {
+        width: 100%;
+        min-height: 5rem;
+        box-sizing: border-box;
+        border-radius: 6px;
+        border: 1px solid #444;
+        background: #1a1a1a;
+        color: #eee;
+        padding: 0.5rem;
+        font: inherit;
+      }
+      button {
+        margin-top: 0.5rem;
+        margin-right: 0.5rem;
+        padding: 0.45rem 0.9rem;
+        border-radius: 6px;
+        border: 1px solid #555;
+        background: #2a2a2a;
+        color: #eee;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .hint {
+        font-size: 0.8rem;
+        color: #888;
+        margin-top: 0.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Локальный агент (Cursor SDK)</h1>
+    <div id="log"></div>
+    <textarea id="input" placeholder="Сообщение агенту…"></textarea>
+    <div>
+      <button type="button" id="send">Отправить</button>
+      <button type="button" id="reset">Сбросить сессию агента</button>
+    </div>
+    <p class="hint">
+      Ответ приходит потоком (SSE). Пока идёт ответ, повторная отправка заблокирована сервером (429).
+    </p>
+    <script>
+      const logElement = document.getElementById("log");
+      const inputElement = document.getElementById("input");
+      const sendButton = document.getElementById("send");
+      const resetButton = document.getElementById("reset");
+
+      function appendLogLine(line) {
+        logElement.textContent += line + "\n";
+        logElement.scrollTop = logElement.scrollHeight;
+      }
+
+      async function postChatStream() {
+        const messageText = inputElement.value.trim();
+        if (!messageText) {
+          appendLogLine("[клиент] Пустое сообщение.");
+          return;
+        }
+        sendButton.disabled = true;
+        resetButton.disabled = true;
+        appendLogLine("\n---\n> " + messageText + "\n");
+        inputElement.value = "";
+
+        const fetchResponse = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: messageText }),
+        });
+
+        if (!fetchResponse.ok) {
+          const errorBodyText = await fetchResponse.text();
+          appendLogLine("[ошибка HTTP " + fetchResponse.status + "] " + errorBodyText);
+          sendButton.disabled = false;
+          resetButton.disabled = false;
+          return;
+        }
+
+        const responseBodyReader = fetchResponse.body.getReader();
+        const textDecoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const readResult = await responseBodyReader.read();
+          if (readResult.done) {
+            break;
+          }
+          buffer += textDecoder.decode(readResult.value, { stream: true });
+          let lineBreakIndex = buffer.indexOf("\n");
+          while (lineBreakIndex !== -1) {
+            const line = buffer.slice(0, lineBreakIndex).trimEnd();
+            buffer = buffer.slice(lineBreakIndex + 1);
+            if (line.startsWith("data:")) {
+              const jsonPayloadText = line.slice(5).trim();
+              try {
+                const parsedPayload = JSON.parse(jsonPayloadText);
+                if (parsedPayload.kind === "assistant_text") {
+                  appendLogLine(parsedPayload.text);
+                } else if (parsedPayload.kind === "run_finished") {
+                  appendLogLine(
+                    "\n[готово] status=" +
+                      parsedPayload.status +
+                      (parsedPayload.runId ? " runId=" + parsedPayload.runId : "")
+                  );
+                } else if (parsedPayload.kind === "error") {
+                  appendLogLine("[ошибка] " + parsedPayload.message);
+                } else {
+                  appendLogLine("[событие] " + jsonPayloadText);
+                }
+              } catch {
+                appendLogLine("[parse] " + jsonPayloadText);
+              }
+            }
+            lineBreakIndex = buffer.indexOf("\n");
+          }
+        }
+
+        sendButton.disabled = false;
+        resetButton.disabled = false;
+      }
+
+      sendButton.addEventListener("click", () => {
+        void postChatStream();
+      });
+
+      resetButton.addEventListener("click", async () => {
+        resetButton.disabled = true;
+        sendButton.disabled = true;
+        const resetResponse = await fetch("/api/reset-agent", { method: "POST" });
+        const resetBodyText = await resetResponse.text();
+        appendLogLine("[сброс] " + resetResponse.status + " " + resetBodyText);
+        resetButton.disabled = false;
+        sendButton.disabled = false;
+      });
+    </script>
+  </body>
+</html>
