@@ -1,0 +1,29 @@
+[Unit]
+Description=Cursor SDK chat gateway (Express)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Пользователь без root (создайте при необходимости): useradd -r -s /usr/sbin/nologin cursoragent
+User=root
+Group=root
+
+# Каталог с clone репозитория, .env и dist/
+WorkingDirectory=/root/cursor_sdk_agent
+
+# Переменные окружения (CURSOR_API_KEY, AGENT_CWD, MCP_* …)
+EnvironmentFile=/root/cursor_sdk_agent/.env
+
+# Путь к node: на сервере выполните `which node` и подставьте сюда (nvm: /root/.nvm/versions/node/v22.22.0/bin/node)
+ExecStart=/usr/bin/node dist/index.js
+
+Restart=on-failure
+RestartSec=5
+
+# Лимиты по желанию
+# LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
