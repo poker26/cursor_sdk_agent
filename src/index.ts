@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   Agent,
   CursorAgentError,
+  type McpServerConfig,
   type SDKAgent,
   type SDKAssistantMessage,
   type SDKMessage,
@@ -70,33 +71,74 @@ function readRequiredEnvironmentVariable(name: string): string {
   return value;
 }
 
-function buildMcpServersConfiguration():
-  | Record<
-      string,
-      {
-        type: "http";
-        url: string;
-        headers: Record<string, string>;
-      }
-    >
-  | undefined {
-  const atlassianMcpBaseUrl = process.env.ATLASSIAN_MCP_URL?.trim();
-  const atlassianMcpApiKey = process.env.ATLASSIAN_MCP_API_KEY?.trim();
-  if (!atlassianMcpBaseUrl && !atlassianMcpApiKey) {
-    return undefined;
+function addHttpMcpServerIfConfigured(
+  targetServers: Record<string, McpServerConfig>,
+  serverLabel: string,
+  baseUrl: string | undefined,
+  apiKeyValue: string | undefined,
+): void {
+  const trimmedUrl = baseUrl?.trim();
+  const trimmedKey = apiKeyValue?.trim();
+  if (!trimmedUrl && !trimmedKey) {
+    return;
   }
-  if (!atlassianMcpBaseUrl || !atlassianMcpApiKey) {
+  if (!trimmedUrl || !trimmedKey) {
     throw new Error(
-      "Set both ATLASSIAN_MCP_URL and ATLASSIAN_MCP_API_KEY, or omit both to run without MCP.",
+      `MCP "${serverLabel}": задайте оба параметра — URL и ключ API, либо уберите оба.`,
     );
   }
-  return {
-    atlassian: {
-      type: "http",
-      url: atlassianMcpBaseUrl,
-      headers: { "X-API-Key": atlassianMcpApiKey },
-    },
+  targetServers[serverLabel] = {
+    type: "http",
+    url: trimmedUrl,
+    headers: { "X-API-Key": trimmedKey },
   };
+}
+
+function mergeMcpServersFromJsonEnv(targetServers: Record<string, McpServerConfig>): void {
+  const rawJson = process.env.MCP_EXTRA_JSON?.trim();
+  if (!rawJson) {
+    return;
+  }
+  let parsedValue: unknown;
+  try {
+    parsedValue = JSON.parse(rawJson) as unknown;
+  } catch {
+    throw new Error("MCP_EXTRA_JSON не является корректным JSON.");
+  }
+  if (parsedValue === null || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
+    throw new Error("MCP_EXTRA_JSON должен быть JSON-объектом вида {\"имя_сервера\": { ... }}");
+  }
+  const entriesFromJson = parsedValue as Record<string, unknown>;
+  for (const [serverLabel, configValue] of Object.entries(entriesFromJson)) {
+    targetServers[serverLabel] = configValue as McpServerConfig;
+  }
+}
+
+function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undefined {
+  const servers: Record<string, McpServerConfig> = {};
+
+  addHttpMcpServerIfConfigured(
+    servers,
+    "atlassian",
+    process.env.ATLASSIAN_MCP_URL,
+    process.env.ATLASSIAN_MCP_API_KEY,
+  );
+  addHttpMcpServerIfConfigured(
+    servers,
+    "gitlab",
+    process.env.GITLAB_MCP_URL,
+    process.env.GITLAB_MCP_API_KEY,
+  );
+  addHttpMcpServerIfConfigured(
+    servers,
+    "minio",
+    process.env.MINIO_MCP_URL,
+    process.env.MINIO_MCP_API_KEY,
+  );
+
+  mergeMcpServersFromJsonEnv(servers);
+
+  return Object.keys(servers).length > 0 ? servers : undefined;
 }
 
 async function getOrCreateSharedChatAgent(): Promise<SDKAgent> {
