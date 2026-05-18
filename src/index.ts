@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -13,8 +14,10 @@ import {
   type Run,
   type SDKAgent,
   type SDKAssistantMessage,
+  type SDKImage,
   type SDKMessage,
   type SDKToolUseMessage,
+  type SDKUserMessage,
 } from "@cursor/sdk";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
@@ -25,19 +28,78 @@ const SESSION_IDLE_DISPOSE_MS = Number.parseInt(
   10,
 );
 
-const application = express();
-application.disable("x-powered-by");
-application.use(express.json({ limit: "512kb" }));
+const UPLOAD_MAX_BYTES = Number.parseInt(
+  process.env.UPLOAD_MAX_BYTES || String(3 * 1024 * 1024),
+  10,
+);
 
-const basicAuthUser = process.env.CHAT_BASIC_USER?.trim();
-const basicAuthPassword = process.env.CHAT_BASIC_PASSWORD?.trim();
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT?.trim() || "8mb";
+
+interface WorkspaceEntry {
+  id: string;
+  label: string;
+  path: string;
+}
+
+interface ClientAttachmentPayload {
+  filename: string;
+  mimeType: string;
+  dataBase64: string;
+}
 
 interface ChatSessionRecord {
   agent: SDKAgent;
   busy: boolean;
   lastActivityAt: number;
   idleDisposeTimer: ReturnType<typeof setTimeout> | undefined;
+  workspaceId: string;
 }
+
+function loadWorkspaceRegistry(): WorkspaceEntry[] {
+  const rawJson = process.env.AGENT_WORKSPACES_JSON?.trim();
+  if (rawJson) {
+    let parsedValue: unknown;
+    try {
+      parsedValue = JSON.parse(rawJson) as unknown;
+    } catch {
+      throw new Error("AGENT_WORKSPACES_JSON: некорректный JSON.");
+    }
+    if (typeof parsedValue !== "object" || parsedValue === null || Array.isArray(parsedValue)) {
+      throw new Error('AGENT_WORKSPACES_JSON: ожидается объект {"id":"/abs/path", ...}.');
+    }
+    const entries: WorkspaceEntry[] = [];
+    for (const [workspaceId, pathValue] of Object.entries(parsedValue as Record<string, unknown>)) {
+      if (typeof pathValue !== "string" || !pathValue.trim()) {
+        throw new Error(`AGENT_WORKSPACES_JSON: пустой путь для "${workspaceId}".`);
+      }
+      entries.push({
+        id: workspaceId,
+        label: workspaceId,
+        path: path.resolve(pathValue.trim()),
+      });
+    }
+    if (entries.length === 0) {
+      throw new Error("AGENT_WORKSPACES_JSON: пустой объект.");
+    }
+    return entries;
+  }
+
+  const singlePath = process.env.AGENT_CWD?.trim();
+  if (!singlePath) {
+    throw new Error("Задайте AGENT_CWD или AGENT_WORKSPACES_JSON.");
+  }
+  return [{ id: "default", label: "default", path: path.resolve(singlePath) }];
+}
+
+const workspaceRegistry = loadWorkspaceRegistry();
+const defaultWorkspaceId = workspaceRegistry[0].id;
+
+const application = express();
+application.disable("x-powered-by");
+application.use(express.json({ limit: JSON_BODY_LIMIT }));
+
+const basicAuthUser = process.env.CHAT_BASIC_USER?.trim();
+const basicAuthPassword = process.env.CHAT_BASIC_PASSWORD?.trim();
 
 const chatSessions = new Map<string, ChatSessionRecord>();
 
@@ -138,6 +200,39 @@ function normalizeSessionId(rawSessionId: unknown): string {
   return trimmed;
 }
 
+function resolveWorkspace(rawWorkspaceId: unknown): WorkspaceEntry {
+  if (typeof rawWorkspaceId === "string" && rawWorkspaceId.trim()) {
+    const found = workspaceRegistry.find((entry) => entry.id === rawWorkspaceId.trim());
+    if (found) {
+      return found;
+    }
+  }
+  const defaultEntry = workspaceRegistry.find((entry) => entry.id === defaultWorkspaceId);
+  return defaultEntry ?? workspaceRegistry[0];
+}
+
+function parseClientAttachments(rawAttachments: unknown): ClientAttachmentPayload[] {
+  if (!Array.isArray(rawAttachments)) {
+    return [];
+  }
+  const parsed: ClientAttachmentPayload[] = [];
+  for (const item of rawAttachments) {
+    if (typeof item !== "object" || item === null) {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const filename = typeof record.filename === "string" ? record.filename.trim() : "";
+    const mimeType =
+      typeof record.mimeType === "string" ? record.mimeType.trim() : "application/octet-stream";
+    const dataBase64 = typeof record.dataBase64 === "string" ? record.dataBase64.trim() : "";
+    if (!filename || !dataBase64) {
+      continue;
+    }
+    parsed.push({ filename, mimeType, dataBase64 });
+  }
+  return parsed.slice(0, 5);
+}
+
 function addHttpMcpServerIfConfigured(
   targetServers: Record<string, McpServerConfig>,
   serverLabel: string,
@@ -208,9 +303,8 @@ function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undef
   return Object.keys(servers).length > 0 ? servers : undefined;
 }
 
-async function createChatAgent(): Promise<SDKAgent> {
+async function createChatAgent(workspace: WorkspaceEntry): Promise<SDKAgent> {
   const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
-  const agentWorkingDirectory = readRequiredEnvironmentVariable("AGENT_CWD");
   const modelId = process.env.CURSOR_MODEL_ID?.trim() || "composer-2";
   const mcpServers = buildMcpServersConfiguration();
 
@@ -218,11 +312,72 @@ async function createChatAgent(): Promise<SDKAgent> {
     apiKey,
     model: { id: modelId },
     local: {
-      cwd: agentWorkingDirectory,
+      cwd: workspace.path,
       settingSources: [],
     },
     ...(mcpServers ? { mcpServers } : {}),
   });
+}
+
+async function buildUserMessagePayload(
+  messageText: string,
+  sessionId: string,
+  workspacePath: string,
+  attachments: ClientAttachmentPayload[],
+): Promise<string | SDKUserMessage> {
+  const trimmedText = messageText.trim();
+  if (attachments.length === 0) {
+    return trimmedText;
+  }
+
+  const uploadRelativeDirectory = path.join(".cursor-chat-uploads", sessionId);
+  const uploadAbsoluteDirectory = path.join(workspacePath, uploadRelativeDirectory);
+  await fs.mkdir(uploadAbsoluteDirectory, { recursive: true });
+
+  const imageBlocks: SDKImage[] = [];
+  const savedFileLines: string[] = [];
+
+  for (const attachment of attachments) {
+    const safeFilename = path.basename(attachment.filename).replace(/[^\w.\-]+/g, "_");
+    const fileBuffer = Buffer.from(attachment.dataBase64, "base64");
+    if (fileBuffer.length > UPLOAD_MAX_BYTES) {
+      throw new Error(
+        `Файл «${safeFilename}» слишком большой (лимит ${UPLOAD_MAX_BYTES} байт).`,
+      );
+    }
+
+    const relativeFilePath = path.join(uploadRelativeDirectory, safeFilename);
+    const absoluteFilePath = path.join(workspacePath, relativeFilePath);
+    await fs.writeFile(absoluteFilePath, fileBuffer);
+
+    const mimeType = attachment.mimeType || "application/octet-stream";
+    const posixRelativePath = relativeFilePath.split(path.sep).join("/");
+
+    if (mimeType.startsWith("image/")) {
+      imageBlocks.push({
+        data: attachment.dataBase64,
+        mimeType,
+      });
+      savedFileLines.push(`${safeFilename} (изображение, также сохранено в ${posixRelativePath})`);
+    } else {
+      savedFileLines.push(`${safeFilename} → ${posixRelativePath}`);
+    }
+  }
+
+  const filesSection = savedFileLines.map((line) => `- ${line}`).join("\n");
+  const textParts: string[] = [];
+  if (trimmedText) {
+    textParts.push(trimmedText);
+  }
+  if (savedFileLines.length > 0) {
+    textParts.push(`[Прикреплённые файлы]\n${filesSection}`);
+  }
+  const composedText = textParts.join("\n\n");
+
+  if (imageBlocks.length > 0) {
+    return { text: composedText, images: imageBlocks };
+  }
+  return composedText;
 }
 
 function clearSessionIdleTimer(sessionRecord: ChatSessionRecord): void {
@@ -260,22 +415,33 @@ async function disposeChatSession(sessionId: string, reason: string): Promise<vo
   }
 }
 
-async function getOrCreateChatSession(sessionId: string): Promise<ChatSessionRecord> {
+async function getOrCreateChatSession(
+  sessionId: string,
+  workspace: WorkspaceEntry,
+): Promise<ChatSessionRecord> {
   const existing = chatSessions.get(sessionId);
   if (existing) {
-    touchSessionActivity(existing);
-    clearSessionIdleTimer(existing);
-    return existing;
+    if (existing.workspaceId !== workspace.id) {
+      await disposeChatSession(sessionId, "workspace changed");
+    } else {
+      touchSessionActivity(existing);
+      clearSessionIdleTimer(existing);
+      return existing;
+    }
   }
-  const agent = await createChatAgent();
+
+  const agent = await createChatAgent(workspace);
   const sessionRecord: ChatSessionRecord = {
     agent,
     busy: false,
     lastActivityAt: Date.now(),
     idleDisposeTimer: undefined,
+    workspaceId: workspace.id,
   };
   chatSessions.set(sessionId, sessionRecord);
-  logServerMessage(`session ${sessionId} created (agent ${agent.agentId})`);
+  logServerMessage(
+    `session ${sessionId} created (agent ${agent.agentId}, workspace ${workspace.id})`,
+  );
   return sessionRecord;
 }
 
@@ -360,8 +526,9 @@ async function streamAgentRunToClient(
 
 async function executeChatMessageForSession(
   sessionId: string,
+  workspace: WorkspaceEntry,
+  userMessagePayload: string | SDKUserMessage,
   response: express.Response,
-  userMessageText: string,
   isClientStillConnected: () => boolean,
   options: { forceLocalRun: boolean; recreateSession: boolean },
 ): Promise<void> {
@@ -369,9 +536,9 @@ async function executeChatMessageForSession(
     await disposeChatSession(sessionId, "recreate before retry");
   }
 
-  const sessionRecord = await getOrCreateChatSession(sessionId);
+  const sessionRecord = await getOrCreateChatSession(sessionId, workspace);
   const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
-  const agentRun = await sessionRecord.agent.send(userMessageText, sendOptions);
+  const agentRun = await sessionRecord.agent.send(userMessagePayload, sendOptions);
   await streamAgentRunToClient(agentRun, response, isClientStillConnected);
 }
 
@@ -380,17 +547,48 @@ application.get("/health", (_request, response) => {
     status: "ok",
     activeSessions: chatSessions.size,
     busySessions: [...chatSessions.values()].filter((record) => record.busy).length,
+    workspaces: workspaceRegistry.length,
   });
 });
 
 application.use(optionalBasicAuthMiddleware);
 
+application.get("/api/config", (_request, response) => {
+  response.json({
+    defaultWorkspaceId,
+    workspaces: workspaceRegistry.map((entry) => ({
+      id: entry.id,
+      label: entry.label,
+      path: entry.path,
+    })),
+    uploadMaxBytes: UPLOAD_MAX_BYTES,
+    modelId: process.env.CURSOR_MODEL_ID?.trim() || "composer-2",
+  });
+});
+
 application.post("/api/chat", async (request, response) => {
   const sessionId = normalizeSessionId(request.body?.sessionId);
+  const workspace = resolveWorkspace(request.body?.workspaceId);
   const userMessageText = typeof request.body?.message === "string" ? request.body.message : "";
+  const attachments = parseClientAttachments(request.body?.attachments);
 
-  if (!userMessageText.trim()) {
-    response.status(400).json({ error: 'Field "message" must be a non-empty string.' });
+  if (!userMessageText.trim() && attachments.length === 0) {
+    response.status(400).json({ error: "Нужен текст сообщения и/или вложения." });
+    return;
+  }
+
+  let userMessagePayload: string | SDKUserMessage;
+  try {
+    userMessagePayload = await buildUserMessagePayload(
+      userMessageText,
+      sessionId,
+      workspace.path,
+      attachments,
+    );
+  } catch (buildError) {
+    response.status(400).json({
+      error: buildError instanceof Error ? buildError.message : String(buildError),
+    });
     return;
   }
 
@@ -403,7 +601,7 @@ application.post("/api/chat", async (request, response) => {
     return;
   }
 
-  const sessionRecord = existingSession ?? (await getOrCreateChatSession(sessionId));
+  const sessionRecord = existingSession ?? (await getOrCreateChatSession(sessionId, workspace));
   sessionRecord.busy = true;
   touchSessionActivity(sessionRecord);
   clearSessionIdleTimer(sessionRecord);
@@ -412,9 +610,10 @@ application.post("/api/chat", async (request, response) => {
   response.setHeader("Cache-Control", "no-cache, no-transform");
   response.setHeader("Connection", "keep-alive");
   response.setHeader("X-Chat-Session-Id", sessionId);
+  response.setHeader("X-Chat-Workspace-Id", workspace.id);
   response.flushHeaders?.();
 
-  writeSseDataLine(response, { kind: "session", sessionId });
+  writeSseDataLine(response, { kind: "session", sessionId, workspaceId: workspace.id });
 
   let clientStillConnected = true;
   request.on("close", () => {
@@ -425,10 +624,14 @@ application.post("/api/chat", async (request, response) => {
 
   try {
     try {
-      await executeChatMessageForSession(sessionId, response, userMessageText, isClientStillConnected, {
-        forceLocalRun: false,
-        recreateSession: false,
-      });
+      await executeChatMessageForSession(
+        sessionId,
+        workspace,
+        userMessagePayload,
+        response,
+        isClientStillConnected,
+        { forceLocalRun: false, recreateSession: false },
+      );
     } catch (firstAttemptError) {
       const normalizedError = normalizeThrownError(firstAttemptError);
       const shouldRecreateSession = isAuthenticationFailure(firstAttemptError);
@@ -446,10 +649,17 @@ application.post("/api/chat", async (request, response) => {
         return;
       }
 
-      await executeChatMessageForSession(sessionId, response, userMessageText, isClientStillConnected, {
-        forceLocalRun: shouldForceLocalRun || shouldRecreateSession,
-        recreateSession: shouldRecreateSession,
-      });
+      await executeChatMessageForSession(
+        sessionId,
+        workspace,
+        userMessagePayload,
+        response,
+        isClientStillConnected,
+        {
+          forceLocalRun: shouldForceLocalRun || shouldRecreateSession,
+          recreateSession: shouldRecreateSession,
+        },
+      );
     }
 
     if (isClientStillConnected()) {
@@ -484,6 +694,7 @@ application.post("/api/chat", async (request, response) => {
 application.post("/api/new-chat", async (request, response) => {
   const previousSessionId =
     typeof request.body?.sessionId === "string" ? normalizeSessionId(request.body.sessionId) : undefined;
+  const workspace = resolveWorkspace(request.body?.workspaceId);
 
   if (previousSessionId) {
     const previousSession = chatSessions.get(previousSessionId);
@@ -495,7 +706,7 @@ application.post("/api/new-chat", async (request, response) => {
   }
 
   const newSessionId = randomUUID();
-  response.json({ ok: true, sessionId: newSessionId });
+  response.json({ ok: true, sessionId: newSessionId, workspaceId: workspace.id });
 });
 
 application.post("/api/reset-agent", async (request, response) => {
@@ -533,6 +744,9 @@ const listenPort = Number.parseInt(process.env.PORT || "3847", 10);
 
 application.listen(listenPort, () => {
   logServerMessage(`listening on http://0.0.0.0:${listenPort}`);
+  logServerMessage(
+    `workspaces: ${workspaceRegistry.map((entry) => `${entry.id}=${entry.path}`).join(", ")}`,
+  );
 });
 
 async function disposeAllSessionsOnShutdown(): Promise<void> {

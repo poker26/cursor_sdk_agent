@@ -27,8 +27,9 @@
       }
       header {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
-        justify-content: space-between;
+        gap: 0.5rem;
         padding: 0.65rem 1rem;
         border-bottom: 1px solid var(--border);
         background: #161b22;
@@ -38,6 +39,7 @@
         margin: 0;
         font-size: 1rem;
         font-weight: 600;
+        margin-right: auto;
       }
       #status-pill {
         font-size: 0.75rem;
@@ -56,7 +58,19 @@
       }
       .toolbar {
         display: flex;
+        flex-wrap: wrap;
         gap: 0.4rem;
+        align-items: center;
+      }
+      #workspace-select {
+        font: inherit;
+        font-size: 0.8rem;
+        padding: 0.35rem 0.5rem;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: #0d1117;
+        color: #e6edf3;
+        max-width: 14rem;
       }
       .toolbar button {
         font: inherit;
@@ -121,6 +135,20 @@
         color: var(--muted);
         margin-top: 0.35rem;
       }
+      .attach-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        margin-bottom: 0.35rem;
+      }
+      .attach-chip {
+        font-size: 0.75rem;
+        padding: 0.15rem 0.45rem;
+        border-radius: 999px;
+        background: #21262d;
+        border: 1px solid var(--border);
+        color: var(--muted);
+      }
       footer {
         border-top: 1px solid var(--border);
         padding: 0.75rem 1rem;
@@ -131,6 +159,14 @@
         display: flex;
         gap: 0.5rem;
         align-items: flex-end;
+      }
+      #composer-side {
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+      #attach-input {
+        display: none;
       }
       #input {
         flex: 1;
@@ -164,37 +200,57 @@
   <body>
     <header>
       <h1>Cursor Agent</h1>
+      <select id="workspace-select" title="Рабочая папка агента (репозиторий)"></select>
       <span id="status-pill">готов</span>
       <div class="toolbar">
-        <button type="button" id="new-chat" title="Новый диалог (новый агент, контекст сброшен)">Новый чат</button>
+        <button type="button" id="attach-btn" title="Прикрепить файл">📎</button>
+        <button type="button" id="new-chat" title="Новый диалог">Новый чат</button>
       </div>
     </header>
 
     <div id="messages" aria-live="polite"></div>
 
     <footer>
+      <div id="attach-list" class="attach-list"></div>
       <div id="composer">
-        <textarea id="input" rows="2" placeholder="Сообщение… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
-        <button type="button" id="send">Отправить</button>
+        <textarea id="input" rows="2" placeholder="Сообщение… (Enter — отправить)"></textarea>
+        <div id="composer-side">
+          <input type="file" id="attach-input" multiple />
+          <button type="button" id="send">Отправить</button>
+        </div>
       </div>
     </footer>
 
     <script>
       const SESSION_STORAGE_KEY = "cursor_sdk_chat_session_id";
+      const WORKSPACE_STORAGE_KEY = "cursor_sdk_chat_workspace_id";
+      const HISTORY_STORAGE_KEY = "cursor_sdk_chat_history_v1";
 
       const messagesElement = document.getElementById("messages");
       const inputElement = document.getElementById("input");
       const sendButton = document.getElementById("send");
       const newChatButton = document.getElementById("new-chat");
+      const attachButton = document.getElementById("attach-btn");
+      const attachInputElement = document.getElementById("attach-input");
+      const attachListElement = document.getElementById("attach-list");
+      const workspaceSelectElement = document.getElementById("workspace-select");
       const statusPillElement = document.getElementById("status-pill");
 
       let chatSessionId = localStorage.getItem(SESSION_STORAGE_KEY) || "";
+      let selectedWorkspaceId = localStorage.getItem(WORKSPACE_STORAGE_KEY) || "";
+      let uploadMaxBytes = 3 * 1024 * 1024;
       let isRequestInFlight = false;
       let currentAgentBubbleElement = null;
+      let pendingAttachments = [];
 
       function persistSessionId(sessionId) {
         chatSessionId = sessionId;
         localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+      }
+
+      function persistWorkspaceId(workspaceId) {
+        selectedWorkspaceId = workspaceId;
+        localStorage.setItem(WORKSPACE_STORAGE_KEY, workspaceId);
       }
 
       function setStatus(label, mode) {
@@ -206,22 +262,77 @@
         messagesElement.scrollTop = messagesElement.scrollHeight;
       }
 
+      function loadHistoryFromStorage() {
+        try {
+          const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+          if (!raw) {
+            return [];
+          }
+          const parsed = JSON.parse(raw);
+          if (!parsed || parsed.sessionId !== chatSessionId || !Array.isArray(parsed.messages)) {
+            return [];
+          }
+          return parsed.messages;
+        } catch {
+          return [];
+        }
+      }
+
+      function saveHistoryToStorage() {
+        const messageNodes = messagesElement.querySelectorAll(".msg");
+        const messages = [];
+        for (const node of messageNodes) {
+          const roleClass = node.className.replace("msg ", "").trim();
+          if (roleClass === "system") {
+            continue;
+          }
+          messages.push({ role: roleClass, text: node.textContent || "" });
+        }
+        localStorage.setItem(
+          HISTORY_STORAGE_KEY,
+          JSON.stringify({ sessionId: chatSessionId, messages }),
+        );
+      }
+
+      function renderHistoryMessages(messages) {
+        messagesElement.innerHTML = "";
+        currentAgentBubbleElement = null;
+        for (const entry of messages) {
+          if (entry.role === "agent" && currentAgentBubbleElement) {
+            currentAgentBubbleElement.textContent += entry.text;
+          } else {
+            currentAgentBubbleElement = null;
+            appendMessageBubble(entry.role, entry.text);
+            if (entry.role === "agent") {
+              currentAgentBubbleElement = messagesElement.lastElementChild;
+            }
+          }
+        }
+        currentAgentBubbleElement = null;
+      }
+
       function appendMessageBubble(role, text) {
-        const bubbleElement = document.createElement('div');
+        const bubbleElement = document.createElement("div");
         bubbleElement.className = "msg " + role;
+        bubbleElement.textContent = text;
+        messagesElement.appendChild(bubbleElement);
+        scrollMessagesToBottom();
+        saveHistoryToStorage();
+        return bubbleElement;
+      }
+
+      function appendSystemNote(text) {
+        const bubbleElement = document.createElement('div');
+        bubbleElement.className = "msg system";
         bubbleElement.textContent = text;
         messagesElement.appendChild(bubbleElement);
         scrollMessagesToBottom();
         return bubbleElement;
       }
 
-      function appendSystemNote(text) {
-        return appendMessageBubble("system", text);
-      }
-
       function ensureAgentBubble() {
         if (!currentAgentBubbleElement) {
-          currentAgentBubbleElement = document.createElement('div');
+          currentAgentBubbleElement = document.createElement("div");
           currentAgentBubbleElement.className = "msg agent";
           messagesElement.appendChild(currentAgentBubbleElement);
         }
@@ -230,18 +341,88 @@
 
       function appendToolHint(text) {
         const agentBubble = ensureAgentBubble();
-        const hintElement = document.createElement('div');
+        const hintElement = document.createElement("div");
         hintElement.className = "tool-hint";
         hintElement.textContent = text;
         agentBubble.appendChild(hintElement);
         scrollMessagesToBottom();
       }
 
+      function renderAttachmentChips() {
+        attachListElement.innerHTML = "";
+        for (const attachment of pendingAttachments) {
+          const chip = document.createElement("span");
+          chip.className = "attach-chip";
+          chip.textContent = attachment.filename;
+          attachListElement.appendChild(chip);
+        }
+      }
+
       function setComposerEnabled(enabled) {
         sendButton.disabled = !enabled;
         newChatButton.disabled = !enabled;
+        attachButton.disabled = !enabled;
         inputElement.disabled = !enabled;
+        workspaceSelectElement.disabled = !enabled || isRequestInFlight;
       }
+
+      async function loadServerConfig() {
+        const response = await fetch("/api/config");
+        if (!response.ok) {
+          appendSystemNote("Не удалось загрузить список репозиториев.");
+          return;
+        }
+        const config = await response.json();
+        uploadMaxBytes = config.uploadMaxBytes || uploadMaxBytes;
+        workspaceSelectElement.innerHTML = "";
+        for (const workspace of config.workspaces || []) {
+          const option = document.createElement("option");
+          option.value = workspace.id;
+          option.textContent = workspace.label || workspace.id;
+          workspaceSelectElement.appendChild(option);
+        }
+        if (!selectedWorkspaceId && config.defaultWorkspaceId) {
+          selectedWorkspaceId = config.defaultWorkspaceId;
+        }
+        if (selectedWorkspaceId) {
+          workspaceSelectElement.value = selectedWorkspaceId;
+        }
+      }
+
+      workspaceSelectElement.addEventListener("change", () => {
+        persistWorkspaceId(workspaceSelectElement.value);
+        appendSystemNote("Репозиторий: " + workspaceSelectElement.value + ". Для смены контекста агента нажмите «Новый чат».");
+      });
+
+      attachButton.addEventListener("click", () => {
+        attachInputElement.click();
+      });
+
+      attachInputElement.addEventListener("change", async () => {
+        const files = attachInputElement.files;
+        if (!files || files.length === 0) {
+          return;
+        }
+        for (const file of files) {
+          if (file.size > uploadMaxBytes) {
+            appendMessageBubble("error", "Файл «" + file.name + "» слишком большой.");
+            continue;
+          }
+          const buffer = await file.arrayBuffer();
+          const bytes = new Uint8Array(buffer);
+          let binary = "";
+          for (let index = 0; index < bytes.length; index += 1) {
+            binary += String.fromCharCode(bytes[index]);
+          }
+          pendingAttachments.push({
+            filename: file.name,
+            mimeType: file.type || "application/octet-stream",
+            dataBase64: btoa(binary),
+          });
+        }
+        attachInputElement.value = "";
+        renderAttachmentChips();
+      });
 
       async function startNewChat() {
         if (isRequestInFlight) {
@@ -252,7 +433,10 @@
           const response = await fetch("/api/new-chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ sessionId: chatSessionId || undefined }),
+            body: JSON.stringify({
+              sessionId: chatSessionId || undefined,
+              workspaceId: workspaceSelectElement.value || selectedWorkspaceId,
+            }),
           });
           const body = await response.json();
           if (!response.ok) {
@@ -261,9 +445,14 @@
             return;
           }
           persistSessionId(body.sessionId);
+          if (body.workspaceId) {
+            persistWorkspaceId(body.workspaceId);
+            workspaceSelectElement.value = body.workspaceId;
+          }
           messagesElement.innerHTML = "";
           currentAgentBubbleElement = null;
-          appendSystemNote("Новый диалог. Контекст агента сброшен.");
+          localStorage.removeItem(HISTORY_STORAGE_KEY);
+          appendSystemNote("Новый диалог · " + (body.workspaceId || selectedWorkspaceId));
           setStatus("готов", "");
         } finally {
           setComposerEnabled(true);
@@ -273,7 +462,7 @@
 
       async function postChatStream() {
         const messageText = inputElement.value.trim();
-        if (!messageText || isRequestInFlight) {
+        if ((!messageText && pendingAttachments.length === 0) || isRequestInFlight) {
           return;
         }
 
@@ -282,8 +471,16 @@
         setComposerEnabled(false);
         setStatus("думает…", "busy");
 
-        appendMessageBubble("user", messageText);
+        const attachmentSnapshot = pendingAttachments.slice();
+        const displayText =
+          messageText +
+          (attachmentSnapshot.length
+            ? "\n\n📎 " + attachmentSnapshot.map((item) => item.filename).join(", ")
+            : "");
+        appendMessageBubble("user", displayText);
         inputElement.value = "";
+        pendingAttachments = [];
+        renderAttachmentChips();
 
         const fetchResponse = await fetch("/api/chat", {
           method: "POST",
@@ -291,12 +488,19 @@
           body: JSON.stringify({
             message: messageText,
             sessionId: chatSessionId || undefined,
+            workspaceId: workspaceSelectElement.value || selectedWorkspaceId,
+            attachments: attachmentSnapshot,
           }),
         });
 
         const responseSessionHeader = fetchResponse.headers.get("X-Chat-Session-Id");
         if (responseSessionHeader) {
           persistSessionId(responseSessionHeader);
+        }
+        const responseWorkspaceHeader = fetchResponse.headers.get("X-Chat-Workspace-Id");
+        if (responseWorkspaceHeader) {
+          persistWorkspaceId(responseWorkspaceHeader);
+          workspaceSelectElement.value = responseWorkspaceHeader;
         }
 
         if (!fetchResponse.ok) {
@@ -336,10 +540,14 @@
                 const event = JSON.parse(jsonPayloadText);
                 if (event.kind === "session" && event.sessionId) {
                   persistSessionId(event.sessionId);
+                }
+                if (event.kind === "session" && event.workspaceId) {
+                  persistWorkspaceId(event.workspaceId);
                 } else if (event.kind === "assistant_text") {
                   const agentBubble = ensureAgentBubble();
                   agentBubble.textContent += event.text;
                   scrollMessagesToBottom();
+                  saveHistoryToStorage();
                 } else if (event.kind === "tool_call") {
                   const label =
                     event.status === "running"
@@ -355,9 +563,11 @@
                   } else {
                     setStatus("готов", "");
                   }
+                  saveHistoryToStorage();
                 } else if (event.kind === "error") {
                   appendMessageBubble("error", event.message);
                   setStatus("ошибка", "error");
+                  saveHistoryToStorage();
                 }
               } catch {
                 /* ignore malformed sse chunk */
@@ -391,12 +601,23 @@
         }
       });
 
-      if (!chatSessionId) {
-        void startNewChat();
-      } else {
-        appendSystemNote("Продолжение диалога. «Новый чат» — сброс контекста агента.");
+      async function bootstrap() {
+        await loadServerConfig();
+        const historyMessages = loadHistoryFromStorage();
+        if (!chatSessionId) {
+          await startNewChat();
+          return;
+        }
+        if (historyMessages.length > 0) {
+          renderHistoryMessages(historyMessages);
+          appendSystemNote("История восстановлена (только экран; контекст агента на сервере мог истечь).");
+        } else {
+          appendSystemNote("Продолжение диалога. «Новый чат» — полный сброс контекста.");
+        }
         setStatus("готов", "");
       }
+
+      void bootstrap();
     </script>
   </body>
 </html>
