@@ -3,115 +3,316 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Cursor SDK — чат</title>
+    <title>Cursor Agent</title>
     <style>
       :root {
-        font-family: system-ui, sans-serif;
-        color: #e8e8e8;
-        background: #121212;
+        font-family: system-ui, -apple-system, sans-serif;
+        color: #e8eaed;
+        background: #0f1114;
+        --user-bg: #1a3a5c;
+        --agent-bg: #1e2228;
+        --border: #2d333b;
+        --accent: #58a6ff;
+        --muted: #8b949e;
+        --error: #f85149;
+      }
+      * {
+        box-sizing: border-box;
       }
       body {
-        margin: 0 auto;
-        max-width: 52rem;
-        padding: 1rem;
+        margin: 0;
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
       }
-      h1 {
-        font-size: 1.1rem;
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.65rem 1rem;
+        border-bottom: 1px solid var(--border);
+        background: #161b22;
+        flex-shrink: 0;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 1rem;
         font-weight: 600;
       }
-      #log {
-        white-space: pre-wrap;
-        min-height: 12rem;
-        border: 1px solid #333;
-        border-radius: 6px;
-        padding: 0.75rem;
-        margin: 0.75rem 0;
-        background: #1a1a1a;
-        font-size: 0.9rem;
-        line-height: 1.45;
+      #status-pill {
+        font-size: 0.75rem;
+        color: var(--muted);
+        padding: 0.2rem 0.55rem;
+        border-radius: 999px;
+        border: 1px solid var(--border);
       }
-      textarea {
-        width: 100%;
-        min-height: 5rem;
-        box-sizing: border-box;
-        border-radius: 6px;
-        border: 1px solid #444;
-        background: #1a1a1a;
-        color: #eee;
-        padding: 0.5rem;
+      #status-pill.busy {
+        color: #f0c674;
+        border-color: #6b5a20;
+      }
+      #status-pill.error {
+        color: var(--error);
+        border-color: #6e3030;
+      }
+      .toolbar {
+        display: flex;
+        gap: 0.4rem;
+      }
+      .toolbar button {
         font: inherit;
-      }
-      button {
-        margin-top: 0.5rem;
-        margin-right: 0.5rem;
-        padding: 0.45rem 0.9rem;
+        font-size: 0.8rem;
+        padding: 0.35rem 0.65rem;
         border-radius: 6px;
-        border: 1px solid #555;
-        background: #2a2a2a;
-        color: #eee;
+        border: 1px solid var(--border);
+        background: #21262d;
+        color: #e6edf3;
         cursor: pointer;
       }
-      button:disabled {
-        opacity: 0.5;
+      .toolbar button:hover:not(:disabled) {
+        background: #30363d;
+      }
+      .toolbar button:disabled {
+        opacity: 0.45;
         cursor: not-allowed;
       }
-      .hint {
-        font-size: 0.8rem;
-        color: #888;
-        margin-top: 0.5rem;
+      #messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 1rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+      .msg {
+        max-width: 92%;
+        padding: 0.65rem 0.85rem;
+        border-radius: 12px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 0.92rem;
+      }
+      .msg.user {
+        align-self: flex-end;
+        background: var(--user-bg);
+        border-bottom-right-radius: 4px;
+      }
+      .msg.agent {
+        align-self: flex-start;
+        background: var(--agent-bg);
+        border: 1px solid var(--border);
+        border-bottom-left-radius: 4px;
+      }
+      .msg.system {
+        align-self: center;
+        font-size: 0.78rem;
+        color: var(--muted);
+        background: transparent;
+        padding: 0.25rem;
+      }
+      .msg.error {
+        align-self: stretch;
+        background: #3d1f1f;
+        border: 1px solid #6e3030;
+        color: #ffb4af;
+      }
+      .tool-hint {
+        font-size: 0.75rem;
+        color: var(--muted);
+        margin-top: 0.35rem;
+      }
+      footer {
+        border-top: 1px solid var(--border);
+        padding: 0.75rem 1rem;
+        background: #161b22;
+        flex-shrink: 0;
+      }
+      #composer {
+        display: flex;
+        gap: 0.5rem;
+        align-items: flex-end;
+      }
+      #input {
+        flex: 1;
+        min-height: 2.75rem;
+        max-height: 10rem;
+        resize: vertical;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: #0d1117;
+        color: #e6edf3;
+        padding: 0.55rem 0.7rem;
+        font: inherit;
+        line-height: 1.4;
+      }
+      #send {
+        flex-shrink: 0;
+        padding: 0.55rem 1rem;
+        border-radius: 8px;
+        border: none;
+        background: var(--accent);
+        color: #0d1117;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #send:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
       }
     </style>
   </head>
   <body>
-    <h1>Локальный агент (Cursor SDK)</h1>
-    <div id="log"></div>
-    <textarea id="input" placeholder="Сообщение агенту…"></textarea>
-    <div>
-      <button type="button" id="send">Отправить</button>
-      <button type="button" id="reset">Сбросить сессию агента</button>
-    </div>
-    <p class="hint">
-      Ответ приходит потоком (SSE). Пока идёт ответ, повторная отправка заблокирована сервером (429).
-    </p>
+    <header>
+      <h1>Cursor Agent</h1>
+      <span id="status-pill">готов</span>
+      <div class="toolbar">
+        <button type="button" id="new-chat" title="Новый диалог (новый агент, контекст сброшен)">Новый чат</button>
+      </div>
+    </header>
+
+    <div id="messages" aria-live="polite"></div>
+
+    <footer>
+      <div id="composer">
+        <textarea id="input" rows="2" placeholder="Сообщение… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+        <button type="button" id="send">Отправить</button>
+      </div>
+    </footer>
+
     <script>
-      const logElement = document.getElementById("log");
+      const SESSION_STORAGE_KEY = "cursor_sdk_chat_session_id";
+
+      const messagesElement = document.getElementById("messages");
       const inputElement = document.getElementById("input");
       const sendButton = document.getElementById("send");
-      const resetButton = document.getElementById("reset");
+      const newChatButton = document.getElementById("new-chat");
+      const statusPillElement = document.getElementById("status-pill");
 
-      function appendLogLine(line) {
-        logElement.textContent += line + "\n";
-        logElement.scrollTop = logElement.scrollHeight;
+      let chatSessionId = localStorage.getItem(SESSION_STORAGE_KEY) || "";
+      let isRequestInFlight = false;
+      let currentAgentBubbleElement = null;
+
+      function persistSessionId(sessionId) {
+        chatSessionId = sessionId;
+        localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
       }
 
-      function appendAssistantTextChunk(chunkText) {
-        logElement.textContent += chunkText;
-        logElement.scrollTop = logElement.scrollHeight;
+      function setStatus(label, mode) {
+        statusPillElement.textContent = label;
+        statusPillElement.className = mode || "";
+      }
+
+      function scrollMessagesToBottom() {
+        messagesElement.scrollTop = messagesElement.scrollHeight;
+      }
+
+      function appendMessageBubble(role, text) {
+        const bubbleElement = document.createElement('div');
+        bubbleElement.className = "msg " + role;
+        bubbleElement.textContent = text;
+        messagesElement.appendChild(bubbleElement);
+        scrollMessagesToBottom();
+        return bubbleElement;
+      }
+
+      function appendSystemNote(text) {
+        return appendMessageBubble("system", text);
+      }
+
+      function ensureAgentBubble() {
+        if (!currentAgentBubbleElement) {
+          currentAgentBubbleElement = document.createElement('div');
+          currentAgentBubbleElement.className = "msg agent";
+          messagesElement.appendChild(currentAgentBubbleElement);
+        }
+        return currentAgentBubbleElement;
+      }
+
+      function appendToolHint(text) {
+        const agentBubble = ensureAgentBubble();
+        const hintElement = document.createElement('div');
+        hintElement.className = "tool-hint";
+        hintElement.textContent = text;
+        agentBubble.appendChild(hintElement);
+        scrollMessagesToBottom();
+      }
+
+      function setComposerEnabled(enabled) {
+        sendButton.disabled = !enabled;
+        newChatButton.disabled = !enabled;
+        inputElement.disabled = !enabled;
+      }
+
+      async function startNewChat() {
+        if (isRequestInFlight) {
+          return;
+        }
+        setComposerEnabled(false);
+        try {
+          const response = await fetch("/api/new-chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId: chatSessionId || undefined }),
+          });
+          const body = await response.json();
+          if (!response.ok) {
+            appendMessageBubble("error", body.error || "Не удалось начать новый чат");
+            setStatus("ошибка", "error");
+            return;
+          }
+          persistSessionId(body.sessionId);
+          messagesElement.innerHTML = "";
+          currentAgentBubbleElement = null;
+          appendSystemNote("Новый диалог. Контекст агента сброшен.");
+          setStatus("готов", "");
+        } finally {
+          setComposerEnabled(true);
+          inputElement.focus();
+        }
       }
 
       async function postChatStream() {
         const messageText = inputElement.value.trim();
-        if (!messageText) {
-          appendLogLine("[клиент] Пустое сообщение.");
+        if (!messageText || isRequestInFlight) {
           return;
         }
-        sendButton.disabled = true;
-        resetButton.disabled = true;
-        appendLogLine("\n---\n> " + messageText);
-        let assistantHeadingWritten = false;
+
+        isRequestInFlight = true;
+        currentAgentBubbleElement = null;
+        setComposerEnabled(false);
+        setStatus("думает…", "busy");
+
+        appendMessageBubble("user", messageText);
         inputElement.value = "";
 
         const fetchResponse = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: messageText }),
+          body: JSON.stringify({
+            message: messageText,
+            sessionId: chatSessionId || undefined,
+          }),
         });
+
+        const responseSessionHeader = fetchResponse.headers.get("X-Chat-Session-Id");
+        if (responseSessionHeader) {
+          persistSessionId(responseSessionHeader);
+        }
 
         if (!fetchResponse.ok) {
           const errorBodyText = await fetchResponse.text();
-          appendLogLine("[ошибка HTTP " + fetchResponse.status + "] " + errorBodyText);
-          sendButton.disabled = false;
-          resetButton.disabled = false;
+          let errorMessage = errorBodyText;
+          try {
+            const parsed = JSON.parse(errorBodyText);
+            errorMessage = parsed.error || errorBodyText;
+          } catch {
+            /* plain text */
+          }
+          appendMessageBubble("error", errorMessage);
+          setStatus("ошибка", "error");
+          isRequestInFlight = false;
+          currentAgentBubbleElement = null;
+          setComposerEnabled(true);
           return;
         }
 
@@ -132,63 +333,70 @@
             if (line.startsWith("data:")) {
               const jsonPayloadText = line.slice(5).trim();
               try {
-                const parsedPayload = JSON.parse(jsonPayloadText);
-                if (parsedPayload.kind === "assistant_text") {
-                  if (!assistantHeadingWritten) {
-                    appendLogLine("");
-                    appendLogLine("Агент:");
-                    assistantHeadingWritten = true;
+                const event = JSON.parse(jsonPayloadText);
+                if (event.kind === "session" && event.sessionId) {
+                  persistSessionId(event.sessionId);
+                } else if (event.kind === "assistant_text") {
+                  const agentBubble = ensureAgentBubble();
+                  agentBubble.textContent += event.text;
+                  scrollMessagesToBottom();
+                } else if (event.kind === "tool_call") {
+                  const label =
+                    event.status === "running"
+                      ? "▶ " + event.name
+                      : event.status === "completed"
+                        ? "✓ " + event.name
+                        : "✗ " + event.name;
+                  appendToolHint(label);
+                } else if (event.kind === "run_finished") {
+                  if (event.status === "error") {
+                    appendMessageBubble("error", "Агент завершил run со статусом error");
+                    setStatus("ошибка", "error");
+                  } else {
+                    setStatus("готов", "");
                   }
-                  appendAssistantTextChunk(parsedPayload.text);
-                } else if (parsedPayload.kind === "run_finished") {
-                  appendLogLine("");
-                  appendLogLine(
-                    "[готово] status=" +
-                      parsedPayload.status +
-                      (parsedPayload.runId ? " runId=" + parsedPayload.runId : "")
-                  );
-                } else if (parsedPayload.kind === "error") {
-                  appendLogLine("[ошибка] " + parsedPayload.message);
-                } else if (parsedPayload.kind === "status") {
-                  if (parsedPayload.status === "ERROR") {
-                    appendLogLine(
-                      "[статус] " + parsedPayload.status + (parsedPayload.message ? " " + parsedPayload.message : "")
-                    );
-                  }
-                } else if (parsedPayload.kind === "thinking") {
-                  /* служебный поток, в лог не выводим */
-                } else if (parsedPayload.kind === "tool_call") {
-                  if (parsedPayload.status === "error") {
-                    appendLogLine("[инструмент] " + parsedPayload.name + " — ошибка");
-                  }
-                } else {
-                  appendLogLine("[событие] " + jsonPayloadText);
+                } else if (event.kind === "error") {
+                  appendMessageBubble("error", event.message);
+                  setStatus("ошибка", "error");
                 }
               } catch {
-                appendLogLine("[parse] " + jsonPayloadText);
+                /* ignore malformed sse chunk */
               }
             }
             lineBreakIndex = buffer.indexOf("\n");
           }
         }
 
-        sendButton.disabled = false;
-        resetButton.disabled = false;
+        isRequestInFlight = false;
+        currentAgentBubbleElement = null;
+        setComposerEnabled(true);
+        if (statusPillElement.className !== "error") {
+          setStatus("готов", "");
+        }
+        inputElement.focus();
       }
 
       sendButton.addEventListener("click", () => {
         void postChatStream();
       });
 
-      resetButton.addEventListener("click", async () => {
-        resetButton.disabled = true;
-        sendButton.disabled = true;
-        const resetResponse = await fetch("/api/reset-agent", { method: "POST" });
-        const resetBodyText = await resetResponse.text();
-        appendLogLine("[сброс] " + resetResponse.status + " " + resetBodyText);
-        resetButton.disabled = false;
-        sendButton.disabled = false;
+      newChatButton.addEventListener("click", () => {
+        void startNewChat();
       });
+
+      inputElement.addEventListener("keydown", (keyboardEvent) => {
+        if (keyboardEvent.key === "Enter" && !keyboardEvent.shiftKey) {
+          keyboardEvent.preventDefault();
+          void postChatStream();
+        }
+      });
+
+      if (!chatSessionId) {
+        void startNewChat();
+      } else {
+        appendSystemNote("Продолжение диалога. «Новый чат» — сброс контекста агента.");
+        setStatus("готов", "");
+      }
     </script>
   </body>
 </html>

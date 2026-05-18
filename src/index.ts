@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -19,12 +20,26 @@ import {
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
 
+const SESSION_IDLE_DISPOSE_MS = Number.parseInt(
+  process.env.SESSION_IDLE_DISPOSE_MS || String(30 * 60 * 1000),
+  10,
+);
+
 const application = express();
 application.disable("x-powered-by");
 application.use(express.json({ limit: "512kb" }));
 
 const basicAuthUser = process.env.CHAT_BASIC_USER?.trim();
 const basicAuthPassword = process.env.CHAT_BASIC_PASSWORD?.trim();
+
+interface ChatSessionRecord {
+  agent: SDKAgent;
+  busy: boolean;
+  lastActivityAt: number;
+  idleDisposeTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+const chatSessions = new Map<string, ChatSessionRecord>();
 
 function sendUnauthorizedResponse(response: express.Response): void {
   response.setHeader("WWW-Authenticate", 'Basic realm="cursor-chat"');
@@ -58,19 +73,6 @@ function optionalBasicAuthMiddleware(
   next();
 }
 
-application.get("/health", (_request, response) => {
-  response.json({
-    status: "ok",
-    agentLoaded: Boolean(sharedChatAgent),
-    chatRequestInFlight,
-  });
-});
-
-application.use(optionalBasicAuthMiddleware);
-
-let sharedChatAgent: SDKAgent | undefined;
-let chatRequestInFlight = false;
-
 function logServerMessage(message: string): void {
   const timestamp = new Date().toISOString();
   console.error(`[cursor-sdk-chat ${timestamp}] ${message}`);
@@ -103,21 +105,6 @@ function isAgentBusyFailure(error: unknown): boolean {
   return convertError(error) instanceof AgentBusyError;
 }
 
-async function disposeSharedChatAgentSilently(): Promise<void> {
-  if (!sharedChatAgent) {
-    return;
-  }
-  const agentToDispose = sharedChatAgent;
-  sharedChatAgent = undefined;
-  try {
-    await agentToDispose[Symbol.asyncDispose]();
-  } catch (disposeError) {
-    logServerMessage(
-      `dispose agent failed: ${disposeError instanceof Error ? disposeError.message : String(disposeError)}`,
-    );
-  }
-}
-
 function normalizeThrownError(error: unknown): Error {
   const converted = convertError(error);
   if (converted instanceof Error) {
@@ -135,6 +122,20 @@ function readRequiredEnvironmentVariable(name: string): string {
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
+}
+
+function normalizeSessionId(rawSessionId: unknown): string {
+  if (typeof rawSessionId !== "string") {
+    return randomUUID();
+  }
+  const trimmed = rawSessionId.trim();
+  if (trimmed.length < 8 || trimmed.length > 128) {
+    return randomUUID();
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
+    return randomUUID();
+  }
+  return trimmed;
 }
 
 function addHttpMcpServerIfConfigured(
@@ -172,7 +173,7 @@ function mergeMcpServersFromJsonEnv(targetServers: Record<string, McpServerConfi
     throw new Error("MCP_EXTRA_JSON не является корректным JSON.");
   }
   if (parsedValue === null || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
-    throw new Error("MCP_EXTRA_JSON должен быть JSON-объектом вида {\"имя_сервера\": { ... }}");
+    throw new Error('MCP_EXTRA_JSON должен быть JSON-объектом вида {"имя_сервера": { ... }}');
   }
   const entriesFromJson = parsedValue as Record<string, unknown>;
   for (const [serverLabel, configValue] of Object.entries(entriesFromJson)) {
@@ -207,16 +208,13 @@ function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undef
   return Object.keys(servers).length > 0 ? servers : undefined;
 }
 
-async function getOrCreateSharedChatAgent(): Promise<SDKAgent> {
-  if (sharedChatAgent) {
-    return sharedChatAgent;
-  }
+async function createChatAgent(): Promise<SDKAgent> {
   const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
   const agentWorkingDirectory = readRequiredEnvironmentVariable("AGENT_CWD");
   const modelId = process.env.CURSOR_MODEL_ID?.trim() || "composer-2";
   const mcpServers = buildMcpServersConfiguration();
 
-  sharedChatAgent = await Agent.create({
+  return Agent.create({
     apiKey,
     model: { id: modelId },
     local: {
@@ -225,7 +223,60 @@ async function getOrCreateSharedChatAgent(): Promise<SDKAgent> {
     },
     ...(mcpServers ? { mcpServers } : {}),
   });
-  return sharedChatAgent;
+}
+
+function clearSessionIdleTimer(sessionRecord: ChatSessionRecord): void {
+  if (sessionRecord.idleDisposeTimer !== undefined) {
+    clearTimeout(sessionRecord.idleDisposeTimer);
+    sessionRecord.idleDisposeTimer = undefined;
+  }
+}
+
+function scheduleSessionIdleDispose(sessionId: string, sessionRecord: ChatSessionRecord): void {
+  clearSessionIdleTimer(sessionRecord);
+  sessionRecord.idleDisposeTimer = setTimeout(() => {
+    void disposeChatSession(sessionId, "idle timeout");
+  }, SESSION_IDLE_DISPOSE_MS);
+}
+
+function touchSessionActivity(sessionRecord: ChatSessionRecord): void {
+  sessionRecord.lastActivityAt = Date.now();
+}
+
+async function disposeChatSession(sessionId: string, reason: string): Promise<void> {
+  const sessionRecord = chatSessions.get(sessionId);
+  if (!sessionRecord) {
+    return;
+  }
+  chatSessions.delete(sessionId);
+  clearSessionIdleTimer(sessionRecord);
+  try {
+    await sessionRecord.agent[Symbol.asyncDispose]();
+    logServerMessage(`session ${sessionId} disposed (${reason})`);
+  } catch (disposeError) {
+    logServerMessage(
+      `session ${sessionId} dispose failed (${reason}): ${disposeError instanceof Error ? disposeError.message : String(disposeError)}`,
+    );
+  }
+}
+
+async function getOrCreateChatSession(sessionId: string): Promise<ChatSessionRecord> {
+  const existing = chatSessions.get(sessionId);
+  if (existing) {
+    touchSessionActivity(existing);
+    clearSessionIdleTimer(existing);
+    return existing;
+  }
+  const agent = await createChatAgent();
+  const sessionRecord: ChatSessionRecord = {
+    agent,
+    busy: false,
+    lastActivityAt: Date.now(),
+    idleDisposeTimer: undefined,
+  };
+  chatSessions.set(sessionId, sessionRecord);
+  logServerMessage(`session ${sessionId} created (agent ${agent.agentId})`);
+  return sessionRecord;
 }
 
 function writeSseDataLine(
@@ -282,7 +333,7 @@ async function streamAgentRunToClient(
           await agentRun.cancel();
         } catch (cancelError) {
           logServerMessage(
-            `cancel after client disconnect failed: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
+            `cancel after disconnect: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
           );
         }
       }
@@ -307,41 +358,63 @@ async function streamAgentRunToClient(
   });
 }
 
-async function executeChatMessage(
+async function executeChatMessageForSession(
+  sessionId: string,
   response: express.Response,
   userMessageText: string,
   isClientStillConnected: () => boolean,
-  options: { forceLocalRun: boolean; recreateAgentFirst: boolean },
+  options: { forceLocalRun: boolean; recreateSession: boolean },
 ): Promise<void> {
-  if (options.recreateAgentFirst) {
-    await disposeSharedChatAgentSilently();
+  if (options.recreateSession) {
+    await disposeChatSession(sessionId, "recreate before retry");
   }
 
-  const chatAgent = await getOrCreateSharedChatAgent();
+  const sessionRecord = await getOrCreateChatSession(sessionId);
   const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
-  const agentRun = await chatAgent.send(userMessageText, sendOptions);
+  const agentRun = await sessionRecord.agent.send(userMessageText, sendOptions);
   await streamAgentRunToClient(agentRun, response, isClientStillConnected);
 }
 
+application.get("/health", (_request, response) => {
+  response.json({
+    status: "ok",
+    activeSessions: chatSessions.size,
+    busySessions: [...chatSessions.values()].filter((record) => record.busy).length,
+  });
+});
+
+application.use(optionalBasicAuthMiddleware);
+
 application.post("/api/chat", async (request, response) => {
-  if (chatRequestInFlight) {
+  const sessionId = normalizeSessionId(request.body?.sessionId);
+  const userMessageText = typeof request.body?.message === "string" ? request.body.message : "";
+
+  if (!userMessageText.trim()) {
+    response.status(400).json({ error: 'Field "message" must be a non-empty string.' });
+    return;
+  }
+
+  const existingSession = chatSessions.get(sessionId);
+  if (existingSession?.busy) {
     response.status(429).json({
-      error: "Another message is still being processed. Wait for it to finish.",
+      error: "Этот диалог ещё обрабатывает предыдущее сообщение. Дождитесь ответа.",
+      sessionId,
     });
     return;
   }
 
-  const userMessageText = typeof request.body?.message === "string" ? request.body.message : "";
-  if (!userMessageText.trim()) {
-    response.status(400).json({ error: "Field \"message\" must be a non-empty string." });
-    return;
-  }
+  const sessionRecord = existingSession ?? (await getOrCreateChatSession(sessionId));
+  sessionRecord.busy = true;
+  touchSessionActivity(sessionRecord);
+  clearSessionIdleTimer(sessionRecord);
 
-  chatRequestInFlight = true;
   response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   response.setHeader("Cache-Control", "no-cache, no-transform");
   response.setHeader("Connection", "keep-alive");
+  response.setHeader("X-Chat-Session-Id", sessionId);
   response.flushHeaders?.();
+
+  writeSseDataLine(response, { kind: "session", sessionId });
 
   let clientStillConnected = true;
   request.on("close", () => {
@@ -352,68 +425,106 @@ application.post("/api/chat", async (request, response) => {
 
   try {
     try {
-      await executeChatMessage(response, userMessageText, isClientStillConnected, {
+      await executeChatMessageForSession(sessionId, response, userMessageText, isClientStillConnected, {
         forceLocalRun: false,
-        recreateAgentFirst: false,
+        recreateSession: false,
       });
     } catch (firstAttemptError) {
       const normalizedError = normalizeThrownError(firstAttemptError);
-      const shouldRecreateAgent = isAuthenticationFailure(firstAttemptError);
+      const shouldRecreateSession = isAuthenticationFailure(firstAttemptError);
       const shouldForceLocalRun = isAgentBusyFailure(firstAttemptError);
 
-      if (!shouldRecreateAgent && !shouldForceLocalRun) {
+      if (!shouldRecreateSession && !shouldForceLocalRun) {
         throw normalizedError;
       }
 
       logServerMessage(
-        `chat retry: recreateAgent=${shouldRecreateAgent} forceLocal=${shouldForceLocalRun} reason=${normalizedError.message}`,
+        `session ${sessionId} retry: recreate=${shouldRecreateSession} force=${shouldForceLocalRun} (${normalizedError.message})`,
       );
 
       if (!isClientStillConnected()) {
         return;
       }
 
-      await executeChatMessage(response, userMessageText, isClientStillConnected, {
-        forceLocalRun: shouldForceLocalRun || shouldRecreateAgent,
-        recreateAgentFirst: shouldRecreateAgent,
+      await executeChatMessageForSession(sessionId, response, userMessageText, isClientStillConnected, {
+        forceLocalRun: shouldForceLocalRun || shouldRecreateSession,
+        recreateSession: shouldRecreateSession,
       });
     }
+
     if (isClientStillConnected()) {
       response.end();
     }
   } catch (error) {
     const normalizedError = normalizeThrownError(error);
     if (isAuthenticationFailure(error)) {
-      await disposeSharedChatAgentSilently();
+      await disposeChatSession(sessionId, "authentication failure");
     }
-    if (isAgentBusyFailure(error)) {
-      logServerMessage("agent busy after failed run; next message will use force or call /api/reset-agent");
-    }
-    logServerMessage(`chat failed: ${normalizedError.message}`);
+    logServerMessage(`session ${sessionId} chat failed: ${normalizedError.message}`);
     if (isClientStillConnected()) {
       const cursorAgentError = normalizedError instanceof CursorAgentError ? normalizedError : undefined;
       writeSseDataLine(response, {
         kind: "error",
         message: normalizedError.message,
         isRetryable: cursorAgentError?.isRetryable ?? false,
-        hint: isAuthenticationFailure(error)
-          ? "Проверьте CURSOR_API_KEY в .env. Агент в памяти сброшен; pm2 restart обычно не нужен."
-          : undefined,
+        sessionId,
       });
       response.end();
     }
   } finally {
-    chatRequestInFlight = false;
+    const updatedSession = chatSessions.get(sessionId);
+    if (updatedSession) {
+      updatedSession.busy = false;
+      touchSessionActivity(updatedSession);
+      scheduleSessionIdleDispose(sessionId, updatedSession);
+    }
   }
 });
 
-application.post("/api/reset-agent", async (_request, response) => {
-  if (chatRequestInFlight) {
-    response.status(429).json({ error: "Wait until the current message finishes." });
+application.post("/api/new-chat", async (request, response) => {
+  const previousSessionId =
+    typeof request.body?.sessionId === "string" ? normalizeSessionId(request.body.sessionId) : undefined;
+
+  if (previousSessionId) {
+    const previousSession = chatSessions.get(previousSessionId);
+    if (previousSession?.busy) {
+      response.status(429).json({ error: "Дождитесь окончания текущего ответа." });
+      return;
+    }
+    await disposeChatSession(previousSessionId, "new chat requested");
+  }
+
+  const newSessionId = randomUUID();
+  response.json({ ok: true, sessionId: newSessionId });
+});
+
+application.post("/api/reset-agent", async (request, response) => {
+  const sessionId =
+    typeof request.body?.sessionId === "string" ? normalizeSessionId(request.body.sessionId) : undefined;
+
+  if (sessionId) {
+    const sessionRecord = chatSessions.get(sessionId);
+    if (sessionRecord?.busy) {
+      response.status(429).json({ error: "Дождитесь окончания текущего ответа." });
+      return;
+    }
+    await disposeChatSession(sessionId, "manual reset");
+    response.json({ ok: true, sessionId, disposed: true });
     return;
   }
-  await disposeSharedChatAgentSilently();
-  response.json({ ok: true, detail: sharedChatAgent ? "still loaded" : "agent disposed" });
+
+  const sessionIds = [...chatSessions.keys()];
+  for (const id of sessionIds) {
+    const record = chatSessions.get(id);
+    if (record?.busy) {
+      response.status(429).json({ error: `Сессия ${id} занята. Повторите позже.` });
+      return;
+    }
+  }
+  for (const id of sessionIds) {
+    await disposeChatSession(id, "reset all");
+  }
+  response.json({ ok: true, disposedSessions: sessionIds.length });
 });
 
 application.use(express.static(publicDirPath));
@@ -421,33 +532,32 @@ application.use(express.static(publicDirPath));
 const listenPort = Number.parseInt(process.env.PORT || "3847", 10);
 
 application.listen(listenPort, () => {
-  // eslint-disable-next-line no-console -- minimal server bootstrap log
-  console.log(`cursor-sdk-chat-gateway listening on http://0.0.0.0:${listenPort}`);
+  logServerMessage(`listening on http://0.0.0.0:${listenPort}`);
 });
 
-async function disposeSharedAgentOnShutdown(): Promise<void> {
-  if (!sharedChatAgent) {
-    return;
+async function disposeAllSessionsOnShutdown(): Promise<void> {
+  const sessionIds = [...chatSessions.keys()];
+  for (const sessionId of sessionIds) {
+    await disposeChatSession(sessionId, "shutdown");
   }
-  const agentToDispose = sharedChatAgent;
-  sharedChatAgent = undefined;
-  await agentToDispose[Symbol.asyncDispose]();
 }
 
 process.on("SIGINT", () => {
-  void disposeSharedAgentOnShutdown().finally(() => process.exit(0));
+  void disposeAllSessionsOnShutdown().finally(() => process.exit(0));
 });
 
 process.on("SIGTERM", () => {
-  void disposeSharedAgentOnShutdown().finally(() => process.exit(0));
+  void disposeAllSessionsOnShutdown().finally(() => process.exit(0));
 });
 
 process.on("unhandledRejection", (reason) => {
   logServerMessage(
     `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`,
   );
-  chatRequestInFlight = false;
   if (isAuthenticationFailure(reason)) {
-    void disposeSharedChatAgentSilently();
+    const sessionIds = [...chatSessions.keys()];
+    for (const sessionId of sessionIds) {
+      void disposeChatSession(sessionId, "unhandled auth rejection");
+    }
   }
 });
