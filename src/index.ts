@@ -309,10 +309,37 @@ function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undef
   return Object.keys(servers).length > 0 ? servers : undefined;
 }
 
+function listConfiguredMcpServersForDiagnostics(): Array<{ id: string; transport: string; endpoint: string }> {
+  const servers = buildMcpServersConfiguration();
+  if (!servers) {
+    return [];
+  }
+  return Object.entries(servers).map(([serverId, config]) => {
+    if ("url" in config) {
+      return {
+        id: serverId,
+        transport: config.type ?? "http",
+        endpoint: config.url,
+      };
+    }
+    return {
+      id: serverId,
+      transport: "stdio",
+      endpoint: config.command,
+    };
+  });
+}
+
 async function createChatAgent(workspace: WorkspaceEntry): Promise<SDKAgent> {
   const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
   const modelId = process.env.CURSOR_MODEL_ID?.trim() || "composer-2";
   const mcpServers = buildMcpServersConfiguration();
+  const mcpServerIds = mcpServers ? Object.keys(mcpServers) : [];
+  if (mcpServerIds.length > 0) {
+    logServerMessage(`creating agent with MCP: ${mcpServerIds.join(", ")}`);
+  } else {
+    logServerMessage("creating agent without MCP servers");
+  }
 
   return Agent.create({
     apiKey,
@@ -560,6 +587,7 @@ application.get("/health", (_request, response) => {
 application.use(optionalBasicAuthMiddleware);
 
 application.get("/api/config", (_request, response) => {
+  const configuredMcpServers = listConfiguredMcpServersForDiagnostics();
   response.json({
     defaultWorkspaceId,
     workspaces: workspaceRegistry.map((entry) => ({
@@ -567,6 +595,8 @@ application.get("/api/config", (_request, response) => {
       label: entry.label,
       path: entry.path,
     })),
+    mcpServers: configuredMcpServers,
+    mcpServerIds: configuredMcpServers.map((entry) => entry.id),
     uploadMaxBytes: UPLOAD_MAX_BYTES,
     modelId: process.env.CURSOR_MODEL_ID?.trim() || "composer-2",
   });
@@ -753,6 +783,14 @@ application.listen(listenPort, () => {
   logServerMessage(
     `workspaces: ${workspaceRegistry.map((entry) => `${entry.id}=${entry.path}`).join(", ")}`,
   );
+  const configuredMcpServers = listConfiguredMcpServersForDiagnostics();
+  if (configuredMcpServers.length === 0) {
+    logServerMessage("MCP at startup: (none)");
+  } else {
+    logServerMessage(
+      `MCP at startup: ${configuredMcpServers.map((entry) => entry.id).join(", ")}`,
+    );
+  }
 });
 
 async function disposeAllSessionsOnShutdown(): Promise<void> {
