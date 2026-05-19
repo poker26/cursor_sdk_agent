@@ -297,6 +297,12 @@ function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undef
     process.env.MINIO_MCP_URL,
     process.env.MINIO_MCP_API_KEY,
   );
+  addHttpMcpServerIfConfigured(
+    servers,
+    "exchange_work",
+    process.env.EXCHANGE_MCP_URL,
+    process.env.EXCHANGE_MCP_API_KEY,
+  );
 
   mergeMcpServersFromJsonEnv(servers);
 
