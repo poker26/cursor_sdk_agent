@@ -24,16 +24,7 @@ async function main(): Promise<void> {
       documents.push({ text: memoryMarkdown, source: "memory_md" });
     }
 
-    let events: Awaited<ReturnType<typeof listRecentEventsForWorkspace>> = [];
-    try {
-      events = await listRecentEventsForWorkspace(workspace.id, 500);
-    } catch (supabaseError) {
-      console.warn(
-        `workspace=${workspace.id} Supabase events skipped: ${
-          supabaseError instanceof Error ? supabaseError.message : String(supabaseError)
-        }`,
-      );
-    }
+    const events = await listRecentEventsForWorkspace(workspace.id, 500);
     for (const event of events) {
       const bodyText =
         typeof event.payload?.body === "string"
