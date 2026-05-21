@@ -20,7 +20,12 @@ import {
   type SDKUserMessage,
 } from "@cursor/sdk";
 import { buildBrainContextPrefix } from "./brain/context-builder.js";
-import { isQdrantBrainEnabled, isSupabaseBrainEnabled } from "./brain/config.js";
+import {
+  getEmbeddingProviderLabel,
+  isEmbeddingEnabled,
+  isQdrantBrainEnabled,
+  isSupabaseBrainEnabled,
+} from "./brain/config.js";
 import { persistBrainAfterRun } from "./brain/post-run.js";
 import { clearWorkspaceBrain } from "./brain/supabase-brain.js";
 import { deleteQdrantCollection } from "./brain/qdrant-brain.js";
@@ -658,6 +663,8 @@ application.get("/health", (_request, response) => {
       memory: true,
       supabase: isSupabaseBrainEnabled(),
       qdrant: isQdrantBrainEnabled(),
+      embeddings: isEmbeddingEnabled(),
+      embeddingProvider: getEmbeddingProviderLabel(),
     },
   });
 });
@@ -681,6 +688,8 @@ application.get("/api/config", (_request, response) => {
       memoryEnabled: true,
       supabase: isSupabaseBrainEnabled(),
       qdrant: isQdrantBrainEnabled(),
+      embeddings: isEmbeddingEnabled(),
+      embeddingProvider: getEmbeddingProviderLabel(),
     },
   });
 });
