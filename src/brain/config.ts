@@ -9,12 +9,28 @@ export function isQdrantBrainEnabled(): boolean {
 }
 
 export function getBgeM3ServiceUrl(): string | undefined {
-  const directUrl = process.env.BGE_M3_URL?.trim();
-  if (directUrl) {
-    return directUrl.replace(/\/$/, "");
+  const baseUrl =
+    process.env.BGE_M3_URL?.trim() || process.env.EMBEDDING_SERVICE_URL?.trim();
+  if (!baseUrl) {
+    return undefined;
   }
-  const legacyUrl = process.env.EMBEDDING_SERVICE_URL?.trim();
-  return legacyUrl ? legacyUrl.replace(/\/$/, "") : undefined;
+
+  const portValue = process.env.BGE_M3_PORT?.trim();
+  if (!portValue) {
+    return baseUrl.replace(/\/$/, "");
+  }
+
+  try {
+    const parsedUrl = new URL(baseUrl.includes("://") ? baseUrl : `http://${baseUrl}`);
+    parsedUrl.port = portValue;
+    return parsedUrl.toString().replace(/\/$/, "");
+  } catch {
+    const withoutTrailingSlash = baseUrl.replace(/\/$/, "");
+    if (/:\d+$/.test(withoutTrailingSlash)) {
+      return withoutTrailingSlash;
+    }
+    return `${withoutTrailingSlash}:${portValue}`;
+  }
 }
 
 export function isBgeM3EmbeddingEnabled(): boolean {
