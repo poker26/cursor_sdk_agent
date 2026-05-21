@@ -7,7 +7,7 @@ import { isQdrantBrainEnabled } from "../src/brain/config.js";
 
 async function main(): Promise<void> {
   if (!isQdrantBrainEnabled()) {
-    console.error("Задайте QDRANT_URL (и OPENAI_API_KEY для эмбеддингов).");
+    console.error("Задайте QDRANT_URL и BGE_M3_URL (или другой embedder).");
     process.exit(1);
   }
 
@@ -24,7 +24,16 @@ async function main(): Promise<void> {
       documents.push({ text: memoryMarkdown, source: "memory_md" });
     }
 
-    const events = await listRecentEventsForWorkspace(workspace.id, 500);
+    let events: Awaited<ReturnType<typeof listRecentEventsForWorkspace>> = [];
+    try {
+      events = await listRecentEventsForWorkspace(workspace.id, 500);
+    } catch (supabaseError) {
+      console.warn(
+        `workspace=${workspace.id} Supabase events skipped: ${
+          supabaseError instanceof Error ? supabaseError.message : String(supabaseError)
+        }`,
+      );
+    }
     for (const event of events) {
       const bodyText =
         typeof event.payload?.body === "string"

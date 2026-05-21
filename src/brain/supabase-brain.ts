@@ -1,5 +1,6 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { isSupabaseBrainEnabled } from "./config.js";
+import { throwSupabaseTransportError } from "./supabase-errors.js";
 
 export interface BrainEventInsert {
   workspaceId: string;
@@ -18,6 +19,27 @@ export interface WorkspaceContextRow {
 }
 
 let cachedSupabaseClient: SupabaseClient | undefined;
+
+function isFetchFailedError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message === "fetch failed" || error.message.includes("fetch failed"))
+  );
+}
+
+async function withSupabaseTransportGuard<T>(
+  operation: string,
+  callback: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await callback();
+  } catch (unknownError) {
+    if (isFetchFailedError(unknownError)) {
+      throwSupabaseTransportError(operation, unknownError);
+    }
+    throw unknownError;
+  }
+}
 
 export function getSupabaseBrainClient(): SupabaseClient | undefined {
   if (!isSupabaseBrainEnabled()) {
@@ -39,17 +61,19 @@ export async function insertBrainEvent(eventInsert: BrainEventInsert): Promise<v
   if (!client) {
     return;
   }
-  const { error } = await client.from("events").insert({
-    workspace_id: eventInsert.workspaceId,
-    source: eventInsert.source,
-    event_type: eventInsert.eventType,
-    title: eventInsert.title ?? null,
-    payload: eventInsert.payload ?? {},
-    occurred_at: eventInsert.occurredAt ?? new Date().toISOString(),
+  await withSupabaseTransportGuard("events insert", async () => {
+    const { error } = await client.from("events").insert({
+      workspace_id: eventInsert.workspaceId,
+      source: eventInsert.source,
+      event_type: eventInsert.eventType,
+      title: eventInsert.title ?? null,
+      payload: eventInsert.payload ?? {},
+      occurred_at: eventInsert.occurredAt ?? new Date().toISOString(),
+    });
+    if (error) {
+      throw new Error(`Supabase events insert: ${error.message}`);
+    }
   });
-  if (error) {
-    throw new Error(`Supabase events insert: ${error.message}`);
-  }
 }
 
 export async function loadWorkspaceContext(
@@ -59,15 +83,17 @@ export async function loadWorkspaceContext(
   if (!client) {
     return undefined;
   }
-  const { data, error } = await client
-    .from("workspace_context")
-    .select("workspace_id, current_focus, compiled_summary, updated_at")
-    .eq("workspace_id", workspaceId)
-    .maybeSingle();
-  if (error) {
-    throw new Error(`Supabase workspace_context read: ${error.message}`);
-  }
-  return data ?? undefined;
+  return withSupabaseTransportGuard("workspace_context read", async () => {
+    const { data, error } = await client
+      .from("workspace_context")
+      .select("workspace_id, current_focus, compiled_summary, updated_at")
+      .eq("workspace_id", workspaceId)
+      .maybeSingle();
+    if (error) {
+      throw new Error(`Supabase workspace_context read: ${error.message}`);
+    }
+    return data ?? undefined;
+  });
 }
 
 export async function upsertWorkspaceContextSummary(
@@ -79,18 +105,20 @@ export async function upsertWorkspaceContextSummary(
   if (!client) {
     return;
   }
-  const row: Record<string, unknown> = {
-    workspace_id: workspaceId,
-    compiled_summary: compiledSummary,
-    updated_at: new Date().toISOString(),
-  };
-  if (currentFocus !== undefined) {
-    row.current_focus = currentFocus;
-  }
-  const { error } = await client.from("workspace_context").upsert(row);
-  if (error) {
-    throw new Error(`Supabase workspace_context upsert: ${error.message}`);
-  }
+  await withSupabaseTransportGuard("workspace_context upsert", async () => {
+    const row: Record<string, unknown> = {
+      workspace_id: workspaceId,
+      compiled_summary: compiledSummary,
+      updated_at: new Date().toISOString(),
+    };
+    if (currentFocus !== undefined) {
+      row.current_focus = currentFocus;
+    }
+    const { error } = await client.from("workspace_context").upsert(row);
+    if (error) {
+      throw new Error(`Supabase workspace_context upsert: ${error.message}`);
+    }
+  });
 }
 
 export async function clearWorkspaceBrain(workspaceId: string): Promise<void> {
@@ -98,11 +126,13 @@ export async function clearWorkspaceBrain(workspaceId: string): Promise<void> {
   if (!client) {
     return;
   }
-  await client.from("events").delete().eq("workspace_id", workspaceId);
-  await client.from("facts").delete().eq("workspace_id", workspaceId);
-  await client.from("relationships").delete().eq("workspace_id", workspaceId);
-  await client.from("entities").delete().eq("workspace_id", workspaceId);
-  await client.from("workspace_context").delete().eq("workspace_id", workspaceId);
+  await withSupabaseTransportGuard("brain clear", async () => {
+    await client.from("events").delete().eq("workspace_id", workspaceId);
+    await client.from("facts").delete().eq("workspace_id", workspaceId);
+    await client.from("relationships").delete().eq("workspace_id", workspaceId);
+    await client.from("entities").delete().eq("workspace_id", workspaceId);
+    await client.from("workspace_context").delete().eq("workspace_id", workspaceId);
+  });
 }
 
 export async function listRecentEventsForWorkspace(
@@ -113,22 +143,24 @@ export async function listRecentEventsForWorkspace(
   if (!client) {
     return [];
   }
-  const { data, error } = await client
-    .from("events")
-    .select("id, title, payload, occurred_at, source")
-    .eq("workspace_id", workspaceId)
-    .order("occurred_at", { ascending: false })
-    .limit(limit);
-  if (error) {
-    throw new Error(`Supabase events list: ${error.message}`);
-  }
-  return (data ?? []) as Array<{
-    id: string;
-    title: string | null;
-    payload: Record<string, unknown>;
-    occurred_at: string;
-    source: string;
-  }>;
+  return withSupabaseTransportGuard("events list", async () => {
+    const { data, error } = await client
+      .from("events")
+      .select("id, title, payload, occurred_at, source")
+      .eq("workspace_id", workspaceId)
+      .order("occurred_at", { ascending: false })
+      .limit(limit);
+    if (error) {
+      throw new Error(`Supabase events list: ${error.message}`);
+    }
+    return (data ?? []) as Array<{
+      id: string;
+      title: string | null;
+      payload: Record<string, unknown>;
+      occurred_at: string;
+      source: string;
+    }>;
+  });
 }
 
 export function extractCompiledSummaryFromMemoryMarkdown(memoryMarkdown: string): string {
