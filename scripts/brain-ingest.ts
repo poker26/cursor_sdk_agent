@@ -86,13 +86,22 @@ async function ingestConfluenceSpace(
   workspaceId: string,
   spaceKey: string,
 ): Promise<{ inserted: number; chunks: IngestTextChunk[] }> {
-  let pages = extractPagesFromMcpResult(
-    await callMcpTool("atlassian", "confluence_search_cql", {
-      cql: `space = "${spaceKey}" ORDER BY lastModified DESC`,
-      limit: 25,
-      include_excerpt: true,
-    }),
-  );
+  let pages: Array<Record<string, unknown>> = [];
+  try {
+    pages = extractPagesFromMcpResult(
+      await callMcpTool("atlassian", "confluence_search_cql", {
+        cql: `space = "${spaceKey}" ORDER BY lastModified DESC`,
+        limit: 25,
+        include_excerpt: true,
+      }),
+    );
+  } catch (cqlError) {
+    console.warn(
+      `confluence_search_cql failed for space ${spaceKey}: ${
+        cqlError instanceof Error ? cqlError.message : String(cqlError)
+      }`,
+    );
+  }
 
   if (pages.length === 0) {
     const todayDate = new Date().toISOString().slice(0, 10);
