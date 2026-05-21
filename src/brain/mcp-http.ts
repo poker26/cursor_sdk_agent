@@ -55,12 +55,18 @@ export async function callMcpTool(
       }),
     });
     if (!initResponse.ok) {
-      throw new Error(`MCP initialize failed: ${initResponse.status}`);
+      const initErrorBody = await initResponse.text();
+      throw new Error(
+        `MCP initialize failed (${serverLabel}): ${initResponse.status} ${initErrorBody.slice(0, 200)}`,
+      );
     }
+    const sessionHeader =
+      initResponse.headers.get("mcp-session-id") ??
+      initResponse.headers.get("Mcp-Session-Id");
     const initJson = (await initResponse.json()) as {
       result?: { sessionId?: string };
     };
-    sessionId = initJson.result?.sessionId ?? "default";
+    sessionId = sessionHeader ?? initJson.result?.sessionId ?? "default";
     mcpSessionIds[serverLabel] = sessionId;
     await fetch(baseUrl, {
       method: "POST",

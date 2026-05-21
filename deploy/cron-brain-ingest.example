@@ -1,0 +1,4 @@
+# Пример cron на VDS (фаза 4). Подставьте путь и пользователя.
+# Каждые 6 часов: Jira PP/FF, Confluence PaymentPlatform, новые письма Exchange → Supabase + Qdrant
+#
+# 0 */6 * * * cd /root/cursor_sdk_agent && /usr/bin/npm run brain:ingest >> /var/log/brain-ingest.log 2>&1
