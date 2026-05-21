@@ -7,7 +7,7 @@ import { isQdrantBrainEnabled, isSupabaseBrainEnabled } from "../src/brain/confi
 
 const JIRA_PP_PROJECT = process.env.BRAIN_JIRA_PP_KEY?.trim() || "PP";
 const JIRA_FF_PROJECT = process.env.BRAIN_JIRA_FF_KEY?.trim() || "FF";
-const CONFLUENCE_PP_SPACE = process.env.BRAIN_CONFLUENCE_PP_SPACE?.trim() || "PaymentPlatform";
+const CONFLUENCE_PP_SPACE_ENV = process.env.BRAIN_CONFLUENCE_PP_SPACE?.trim() || "PP";
 
 interface IngestTextChunk {
   text: string;
@@ -50,16 +50,63 @@ async function ingestJiraProject(
   return { inserted, chunks };
 }
 
+async function resolveConfluenceSpaceKey(): Promise<string> {
+  const preferredKeys = [
+    CONFLUENCE_PP_SPACE_ENV,
+    "PP",
+    "PaymentPlatform",
+    "PAYMENTPLATFORM",
+  ];
+  try {
+    const spacesResult = await callMcpTool("atlassian", "confluence_list_spaces", {
+      limit: 100,
+    });
+    const spaces = extractSpacesFromMcpResult(spacesResult);
+    for (const preferred of preferredKeys) {
+      const exact = spaces.find(
+        (space) => String(space.key ?? "").toUpperCase() === preferred.toUpperCase(),
+      );
+      if (exact?.key) {
+        return String(exact.key);
+      }
+    }
+    const byName = spaces.find((space) =>
+      /payment/i.test(String(space.name ?? "")),
+    );
+    if (byName?.key) {
+      return String(byName.key);
+    }
+  } catch {
+    /* use env default */
+  }
+  return CONFLUENCE_PP_SPACE_ENV;
+}
+
 async function ingestConfluenceSpace(
   workspaceId: string,
   spaceKey: string,
 ): Promise<{ inserted: number; chunks: IngestTextChunk[] }> {
-  const searchResult = await callMcpTool("atlassian", "confluence_search_cql", {
-    cql: `space = "${spaceKey}" ORDER BY lastModified DESC`,
-    limit: 15,
-    include_excerpt: true,
-  });
-  const pages = extractPagesFromMcpResult(searchResult);
+  let pages = extractPagesFromMcpResult(
+    await callMcpTool("atlassian", "confluence_search_cql", {
+      cql: `space = "${spaceKey}" ORDER BY lastModified DESC`,
+      limit: 25,
+      include_excerpt: true,
+    }),
+  );
+
+  if (pages.length === 0) {
+    const todayDate = new Date().toISOString().slice(0, 10);
+    pages = extractPagesFromMcpResult(
+      await callMcpTool("atlassian", "confluence_search_by_date", {
+        date_from: todayDate,
+        timezone: "Europe/Moscow",
+        space_key: spaceKey,
+        field: "lastmodified",
+        max_results: 25,
+      }),
+    );
+  }
+
   const chunks: IngestTextChunk[] = [];
   let inserted = 0;
   for (const page of pages) {
@@ -135,10 +182,21 @@ function extractPagesFromMcpResult(raw: unknown): Array<Record<string, unknown>>
   if (typeof raw === "object" && raw !== null) {
     const record = raw as Record<string, unknown>;
     if (Array.isArray(record.results)) {
+      const first = record.results[0];
+      if (first && typeof first === "object" && Array.isArray((first as Record<string, unknown>).results)) {
+        return (first as Record<string, unknown>).results as Array<Record<string, unknown>>;
+      }
       return record.results as Array<Record<string, unknown>>;
+    }
+    if (Array.isArray(record.pages)) {
+      return record.pages as Array<Record<string, unknown>>;
     }
   }
   return [];
+}
+
+function extractSpacesFromMcpResult(raw: unknown): Array<Record<string, unknown>> {
+  return extractPagesFromMcpResult(raw);
 }
 
 function extractEmailsFromMcpResult(raw: unknown): Array<Record<string, unknown>> {
@@ -208,10 +266,13 @@ async function main(): Promise<void> {
     }
 
     try {
-      const confluenceResult = await ingestConfluenceSpace(workspace.id, CONFLUENCE_PP_SPACE);
+      const confluenceSpaceKey = await resolveConfluenceSpaceKey();
+      const confluenceResult = await ingestConfluenceSpace(workspace.id, confluenceSpaceKey);
       totalInserted += confluenceResult.inserted;
       allChunks.push(...confluenceResult.chunks);
-      console.log(`workspace=${workspace.id} confluence=${confluenceResult.inserted}`);
+      console.log(
+        `workspace=${workspace.id} confluence=${confluenceResult.inserted} spaceKey=${confluenceSpaceKey}`,
+      );
     } catch (error) {
       console.error(
         `workspace=${workspace.id} confluence failed: ${
