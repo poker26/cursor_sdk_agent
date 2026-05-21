@@ -204,7 +204,8 @@
       <span id="status-pill">готов</span>
       <div class="toolbar">
         <button type="button" id="attach-btn" title="Прикрепить файл">📎</button>
-        <button type="button" id="new-chat" title="Новый диалог">Новый чат</button>
+        <button type="button" id="new-chat" title="Новая вкладка UI, память workspace сохраняется">Новая вкладка</button>
+        <button type="button" id="reset-memory" title="Очистить memory.md, Supabase, Qdrant и пересоздать агента">Сбросить память</button>
       </div>
     </header>
 
@@ -230,6 +231,7 @@
       const inputElement = document.getElementById("input");
       const sendButton = document.getElementById("send");
       const newChatButton = document.getElementById("new-chat");
+      const resetMemoryButton = document.getElementById("reset-memory");
       const attachButton = document.getElementById("attach-btn");
       const attachInputElement = document.getElementById("attach-input");
       const attachListElement = document.getElementById("attach-list");
@@ -361,6 +363,7 @@
       function setComposerEnabled(enabled) {
         sendButton.disabled = !enabled;
         newChatButton.disabled = !enabled;
+        resetMemoryButton.disabled = !enabled;
         attachButton.disabled = !enabled;
         inputElement.disabled = !enabled;
         workspaceSelectElement.disabled = !enabled || isRequestInFlight;
@@ -391,7 +394,11 @@
 
       workspaceSelectElement.addEventListener("change", () => {
         persistWorkspaceId(workspaceSelectElement.value);
-        appendSystemNote("Репозиторий: " + workspaceSelectElement.value + ". Для смены контекста агента нажмите «Новый чат».");
+        appendSystemNote(
+          "Репозиторий: " +
+            workspaceSelectElement.value +
+            ". Долгосрочная память привязана к workspace; «Новая вкладка» только очищает экран.",
+        );
       });
 
       attachButton.addEventListener("click", () => {
@@ -452,7 +459,11 @@
           messagesElement.innerHTML = "";
           currentAgentBubbleElement = null;
           localStorage.removeItem(HISTORY_STORAGE_KEY);
-          appendSystemNote("Новый диалог · " + (body.workspaceId || selectedWorkspaceId));
+          appendSystemNote(
+            "Новая вкладка · " +
+              (body.workspaceId || selectedWorkspaceId) +
+              (body.agentPreserved ? " · память и агент workspace сохранены" : ""),
+          );
           setStatus("готов", "");
         } finally {
           setComposerEnabled(true);
@@ -594,6 +605,42 @@
         void startNewChat();
       });
 
+      async function resetWorkspaceMemory() {
+        if (isRequestInFlight) {
+          return;
+        }
+        if (!confirm("Сбросить долгосрочную память для текущего workspace?")) {
+          return;
+        }
+        setComposerEnabled(false);
+        try {
+          const response = await fetch("/api/reset-memory", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              workspaceId: workspaceSelectElement.value || selectedWorkspaceId,
+            }),
+          });
+          const body = await response.json();
+          if (!response.ok) {
+            appendMessageBubble("error", body.error || "Не удалось сбросить память");
+            setStatus("ошибка", "error");
+            return;
+          }
+          messagesElement.innerHTML = "";
+          currentAgentBubbleElement = null;
+          localStorage.removeItem(HISTORY_STORAGE_KEY);
+          appendSystemNote("Память workspace сброшена · " + (body.workspaceId || selectedWorkspaceId));
+          setStatus("готов", "");
+        } finally {
+          setComposerEnabled(true);
+        }
+      }
+
+      resetMemoryButton.addEventListener("click", () => {
+        void resetWorkspaceMemory();
+      });
+
       inputElement.addEventListener("keydown", (keyboardEvent) => {
         if (keyboardEvent.key === "Enter" && !keyboardEvent.shiftKey) {
           keyboardEvent.preventDefault();
@@ -610,9 +657,13 @@
         }
         if (historyMessages.length > 0) {
           renderHistoryMessages(historyMessages);
-          appendSystemNote("История восстановлена (только экран; контекст агента на сервере мог истечь).");
+          appendSystemNote(
+            "История восстановлена (только экран). Долгосрочная память — в memory.md / brain на сервере.",
+          );
         } else {
-          appendSystemNote("Продолжение диалога. «Новый чат» — полный сброс контекста.");
+          appendSystemNote(
+            "Продолжение диалога. «Новая вкладка» — новый sessionId без сброса памяти workspace.",
+          );
         }
         setStatus("готов", "");
       }

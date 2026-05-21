@@ -19,6 +19,21 @@ import {
   type SDKToolUseMessage,
   type SDKUserMessage,
 } from "@cursor/sdk";
+import { buildBrainContextPrefix } from "./brain/context-builder.js";
+import { isQdrantBrainEnabled, isSupabaseBrainEnabled } from "./brain/config.js";
+import { persistBrainAfterRun } from "./brain/post-run.js";
+import { clearWorkspaceBrain } from "./brain/supabase-brain.js";
+import { deleteQdrantCollection } from "./brain/qdrant-brain.js";
+import { clearMemoryFile } from "./memory.js";
+import {
+  clearPersistedAgentId,
+  loadPersistedAgentId,
+  savePersistedAgentId,
+} from "./workspace-state.js";
+import {
+  loadWorkspaceRegistryFromEnv,
+  type WorkspaceEntry,
+} from "./workspace-registry.js";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
@@ -35,63 +50,26 @@ const UPLOAD_MAX_BYTES = Number.parseInt(
 
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT?.trim() || "8mb";
 
-interface WorkspaceEntry {
-  id: string;
-  label: string;
-  path: string;
-}
-
 interface ClientAttachmentPayload {
   filename: string;
   mimeType: string;
   dataBase64: string;
 }
 
-interface ChatSessionRecord {
+interface WorkspaceAgentRecord {
   agent: SDKAgent;
+  workspaceId: string;
   busy: boolean;
   lastActivityAt: number;
   idleDisposeTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+interface SessionLockRecord {
+  busy: boolean;
   workspaceId: string;
 }
 
-function loadWorkspaceRegistry(): WorkspaceEntry[] {
-  const rawJson = process.env.AGENT_WORKSPACES_JSON?.trim();
-  if (rawJson) {
-    let parsedValue: unknown;
-    try {
-      parsedValue = JSON.parse(rawJson) as unknown;
-    } catch {
-      throw new Error("AGENT_WORKSPACES_JSON: некорректный JSON.");
-    }
-    if (typeof parsedValue !== "object" || parsedValue === null || Array.isArray(parsedValue)) {
-      throw new Error('AGENT_WORKSPACES_JSON: ожидается объект {"id":"/abs/path", ...}.');
-    }
-    const entries: WorkspaceEntry[] = [];
-    for (const [workspaceId, pathValue] of Object.entries(parsedValue as Record<string, unknown>)) {
-      if (typeof pathValue !== "string" || !pathValue.trim()) {
-        throw new Error(`AGENT_WORKSPACES_JSON: пустой путь для "${workspaceId}".`);
-      }
-      entries.push({
-        id: workspaceId,
-        label: workspaceId,
-        path: path.resolve(pathValue.trim()),
-      });
-    }
-    if (entries.length === 0) {
-      throw new Error("AGENT_WORKSPACES_JSON: пустой объект.");
-    }
-    return entries;
-  }
-
-  const singlePath = process.env.AGENT_CWD?.trim();
-  if (!singlePath) {
-    throw new Error("Задайте AGENT_CWD или AGENT_WORKSPACES_JSON.");
-  }
-  return [{ id: "default", label: "default", path: path.resolve(singlePath) }];
-}
-
-const workspaceRegistry = loadWorkspaceRegistry();
+const workspaceRegistry = loadWorkspaceRegistryFromEnv();
 const defaultWorkspaceId = workspaceRegistry[0].id;
 
 const application = express();
@@ -101,7 +79,8 @@ application.use(express.json({ limit: JSON_BODY_LIMIT }));
 const basicAuthUser = process.env.CHAT_BASIC_USER?.trim();
 const basicAuthPassword = process.env.CHAT_BASIC_PASSWORD?.trim();
 
-const chatSessions = new Map<string, ChatSessionRecord>();
+const workspaceAgents = new Map<string, WorkspaceAgentRecord>();
+const sessionLocks = new Map<string, SessionLockRecord>();
 
 function sendUnauthorizedResponse(response: express.Response): void {
   response.setHeader("WWW-Authenticate", 'Basic realm="cursor-chat"');
@@ -352,6 +331,36 @@ async function createChatAgent(workspace: WorkspaceEntry): Promise<SDKAgent> {
   });
 }
 
+async function resumeOrCreateWorkspaceAgent(workspace: WorkspaceEntry): Promise<SDKAgent> {
+  const persistedAgentId = await loadPersistedAgentId(workspace.id);
+  if (persistedAgentId) {
+    try {
+      const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
+      const modelId = process.env.CURSOR_MODEL_ID?.trim() || "composer-2";
+      const mcpServers = buildMcpServersConfiguration();
+      const agent = await Agent.resume(persistedAgentId, {
+        apiKey,
+        model: { id: modelId },
+        local: {
+          cwd: workspace.path,
+          settingSources: [],
+        },
+        ...(mcpServers ? { mcpServers } : {}),
+      });
+      logServerMessage(
+        `workspace ${workspace.id} resumed agent ${agent.agentId}`,
+      );
+      return agent;
+    } catch (resumeError) {
+      logServerMessage(
+        `workspace ${workspace.id} resume failed: ${resumeError instanceof Error ? resumeError.message : String(resumeError)}`,
+      );
+      await clearPersistedAgentId(workspace.id);
+    }
+  }
+  return createChatAgent(workspace);
+}
+
 async function buildUserMessagePayload(
   messageText: string,
   sessionId: string,
@@ -413,69 +422,69 @@ async function buildUserMessagePayload(
   return composedText;
 }
 
-function clearSessionIdleTimer(sessionRecord: ChatSessionRecord): void {
-  if (sessionRecord.idleDisposeTimer !== undefined) {
-    clearTimeout(sessionRecord.idleDisposeTimer);
-    sessionRecord.idleDisposeTimer = undefined;
+function clearWorkspaceIdleTimer(workspaceRecord: WorkspaceAgentRecord): void {
+  if (workspaceRecord.idleDisposeTimer !== undefined) {
+    clearTimeout(workspaceRecord.idleDisposeTimer);
+    workspaceRecord.idleDisposeTimer = undefined;
   }
 }
 
-function scheduleSessionIdleDispose(sessionId: string, sessionRecord: ChatSessionRecord): void {
-  clearSessionIdleTimer(sessionRecord);
-  sessionRecord.idleDisposeTimer = setTimeout(() => {
-    void disposeChatSession(sessionId, "idle timeout");
+function scheduleWorkspaceIdleDispose(
+  workspaceId: string,
+  workspaceRecord: WorkspaceAgentRecord,
+): void {
+  clearWorkspaceIdleTimer(workspaceRecord);
+  workspaceRecord.idleDisposeTimer = setTimeout(() => {
+    void disposeWorkspaceAgent(workspaceId, "idle timeout");
   }, SESSION_IDLE_DISPOSE_MS);
 }
 
-function touchSessionActivity(sessionRecord: ChatSessionRecord): void {
-  sessionRecord.lastActivityAt = Date.now();
+function touchWorkspaceActivity(workspaceRecord: WorkspaceAgentRecord): void {
+  workspaceRecord.lastActivityAt = Date.now();
 }
 
-async function disposeChatSession(sessionId: string, reason: string): Promise<void> {
-  const sessionRecord = chatSessions.get(sessionId);
-  if (!sessionRecord) {
+async function disposeWorkspaceAgent(workspaceId: string, reason: string): Promise<void> {
+  const workspaceRecord = workspaceAgents.get(workspaceId);
+  if (!workspaceRecord) {
     return;
   }
-  chatSessions.delete(sessionId);
-  clearSessionIdleTimer(sessionRecord);
+  workspaceAgents.delete(workspaceId);
+  clearWorkspaceIdleTimer(workspaceRecord);
   try {
-    await sessionRecord.agent[Symbol.asyncDispose]();
-    logServerMessage(`session ${sessionId} disposed (${reason})`);
+    await workspaceRecord.agent[Symbol.asyncDispose]();
+    logServerMessage(`workspace ${workspaceId} agent disposed (${reason})`);
   } catch (disposeError) {
     logServerMessage(
-      `session ${sessionId} dispose failed (${reason}): ${disposeError instanceof Error ? disposeError.message : String(disposeError)}`,
+      `workspace ${workspaceId} dispose failed (${reason}): ${disposeError instanceof Error ? disposeError.message : String(disposeError)}`,
     );
   }
 }
 
-async function getOrCreateChatSession(
-  sessionId: string,
+async function getOrCreateWorkspaceAgent(
   workspace: WorkspaceEntry,
-): Promise<ChatSessionRecord> {
-  const existing = chatSessions.get(sessionId);
+): Promise<WorkspaceAgentRecord> {
+  const existing = workspaceAgents.get(workspace.id);
   if (existing) {
-    if (existing.workspaceId !== workspace.id) {
-      await disposeChatSession(sessionId, "workspace changed");
-    } else {
-      touchSessionActivity(existing);
-      clearSessionIdleTimer(existing);
-      return existing;
-    }
+    touchWorkspaceActivity(existing);
+    clearWorkspaceIdleTimer(existing);
+    return existing;
   }
 
-  const agent = await createChatAgent(workspace);
-  const sessionRecord: ChatSessionRecord = {
+  const agent = await resumeOrCreateWorkspaceAgent(workspace);
+  await savePersistedAgentId(workspace.id, agent.agentId);
+
+  const workspaceRecord: WorkspaceAgentRecord = {
     agent,
+    workspaceId: workspace.id,
     busy: false,
     lastActivityAt: Date.now(),
     idleDisposeTimer: undefined,
-    workspaceId: workspace.id,
   };
-  chatSessions.set(sessionId, sessionRecord);
+  workspaceAgents.set(workspace.id, workspaceRecord);
   logServerMessage(
-    `session ${sessionId} created (agent ${agent.agentId}, workspace ${workspace.id})`,
+    `workspace ${workspace.id} agent ready (${agent.agentId})`,
   );
-  return sessionRecord;
+  return workspaceRecord;
 }
 
 function writeSseDataLine(
@@ -524,7 +533,8 @@ async function streamAgentRunToClient(
   agentRun: Run,
   response: express.Response,
   isClientStillConnected: () => boolean,
-): Promise<void> {
+  onAssistantText: (textDelta: string) => void,
+): Promise<{ status: string; result?: string; runId: string }> {
   for await (const streamMessage of agentRun.stream()) {
     if (!isClientStillConnected()) {
       if (agentRun.supports("cancel")) {
@@ -538,6 +548,12 @@ async function streamAgentRunToClient(
       }
       break;
     }
+    if (streamMessage.type === "assistant") {
+      const textDelta = extractAssistantTextDelta(streamMessage);
+      if (textDelta) {
+        onAssistantText(textDelta);
+      }
+    }
     const clientPayload = describeStreamMessageForClient(streamMessage);
     if (clientPayload) {
       writeSseDataLine(response, clientPayload);
@@ -545,7 +561,7 @@ async function streamAgentRunToClient(
   }
 
   if (!isClientStillConnected()) {
-    return;
+    return { status: "cancelled", runId: agentRun.id };
   }
 
   const terminalResult = await agentRun.wait();
@@ -555,32 +571,94 @@ async function streamAgentRunToClient(
     result: terminalResult.result,
     runId: agentRun.id,
   });
+  return {
+    status: terminalResult.status,
+    result: terminalResult.result,
+    runId: agentRun.id,
+  };
 }
 
-async function executeChatMessageForSession(
-  sessionId: string,
-  workspace: WorkspaceEntry,
+function prependTextToUserPayload(
   userMessagePayload: string | SDKUserMessage,
+  prefix: string,
+): string | SDKUserMessage {
+  if (!prefix.trim()) {
+    return userMessagePayload;
+  }
+  if (typeof userMessagePayload === "string") {
+    return `${prefix}${userMessagePayload}`;
+  }
+  return {
+    ...userMessagePayload,
+    text: `${prefix}${userMessagePayload.text ?? ""}`,
+  };
+}
+
+async function executeChatMessageForWorkspace(
+  workspace: WorkspaceEntry,
+  sessionId: string,
+  userMessagePayload: string | SDKUserMessage,
+  userMessageText: string,
   response: express.Response,
   isClientStillConnected: () => boolean,
-  options: { forceLocalRun: boolean; recreateSession: boolean },
+  options: { forceLocalRun: boolean; recreateWorkspaceAgent: boolean },
 ): Promise<void> {
-  if (options.recreateSession) {
-    await disposeChatSession(sessionId, "recreate before retry");
+  if (options.recreateWorkspaceAgent) {
+    await disposeWorkspaceAgent(workspace.id, "recreate before retry");
+    await clearPersistedAgentId(workspace.id);
   }
 
-  const sessionRecord = await getOrCreateChatSession(sessionId, workspace);
+  const workspaceRecord = await getOrCreateWorkspaceAgent(workspace);
+  const brainPrefix = await buildBrainContextPrefix({
+    workspaceId: workspace.id,
+    workspacePath: workspace.path,
+    userMessageText,
+  });
+  const payloadWithBrain = prependTextToUserPayload(userMessagePayload, brainPrefix);
+
   const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
-  const agentRun = await sessionRecord.agent.send(userMessagePayload, sendOptions);
-  await streamAgentRunToClient(agentRun, response, isClientStillConnected);
+  const agentRun = await workspaceRecord.agent.send(payloadWithBrain, sendOptions);
+
+  let assistantAccumulatedText = "";
+  const runOutcome = await streamAgentRunToClient(
+    agentRun,
+    response,
+    isClientStillConnected,
+    (textDelta) => {
+      assistantAccumulatedText += textDelta;
+    },
+  );
+
+  if (runOutcome.status !== "error" && isClientStillConnected()) {
+    try {
+      await persistBrainAfterRun({
+        workspaceId: workspace.id,
+        workspacePath: workspace.path,
+        userMessageText,
+        assistantMessageText: assistantAccumulatedText,
+        runId: runOutcome.runId,
+        runStatus: runOutcome.status,
+      });
+    } catch (brainError) {
+      logServerMessage(
+        `brain persist failed: ${brainError instanceof Error ? brainError.message : String(brainError)}`,
+      );
+    }
+  }
 }
 
 application.get("/health", (_request, response) => {
   response.json({
     status: "ok",
-    activeSessions: chatSessions.size,
-    busySessions: [...chatSessions.values()].filter((record) => record.busy).length,
+    activeWorkspaceAgents: workspaceAgents.size,
+    busyWorkspaceAgents: [...workspaceAgents.values()].filter((record) => record.busy).length,
+    activeSessionLocks: sessionLocks.size,
     workspaces: workspaceRegistry.length,
+    brain: {
+      memory: true,
+      supabase: isSupabaseBrainEnabled(),
+      qdrant: isQdrantBrainEnabled(),
+    },
   });
 });
 
@@ -599,6 +677,11 @@ application.get("/api/config", (_request, response) => {
     mcpServerIds: configuredMcpServers.map((entry) => entry.id),
     uploadMaxBytes: UPLOAD_MAX_BYTES,
     modelId: process.env.CURSOR_MODEL_ID?.trim() || "composer-2",
+    brain: {
+      memoryEnabled: true,
+      supabase: isSupabaseBrainEnabled(),
+      qdrant: isQdrantBrainEnabled(),
+    },
   });
 });
 
@@ -628,8 +711,8 @@ application.post("/api/chat", async (request, response) => {
     return;
   }
 
-  const existingSession = chatSessions.get(sessionId);
-  if (existingSession?.busy) {
+  const sessionLock = sessionLocks.get(sessionId);
+  if (sessionLock?.busy) {
     response.status(429).json({
       error: "Этот диалог ещё обрабатывает предыдущее сообщение. Дождитесь ответа.",
       sessionId,
@@ -637,10 +720,20 @@ application.post("/api/chat", async (request, response) => {
     return;
   }
 
-  const sessionRecord = existingSession ?? (await getOrCreateChatSession(sessionId, workspace));
-  sessionRecord.busy = true;
-  touchSessionActivity(sessionRecord);
-  clearSessionIdleTimer(sessionRecord);
+  const workspaceRecord = workspaceAgents.get(workspace.id);
+  if (workspaceRecord?.busy) {
+    response.status(429).json({
+      error: "Агент workspace занят другим запросом. Дождитесь ответа.",
+      workspaceId: workspace.id,
+    });
+    return;
+  }
+
+  sessionLocks.set(sessionId, { busy: true, workspaceId: workspace.id });
+  const ensuredWorkspace = await getOrCreateWorkspaceAgent(workspace);
+  ensuredWorkspace.busy = true;
+  touchWorkspaceActivity(ensuredWorkspace);
+  clearWorkspaceIdleTimer(ensuredWorkspace);
 
   response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   response.setHeader("Cache-Control", "no-cache, no-transform");
@@ -660,40 +753,42 @@ application.post("/api/chat", async (request, response) => {
 
   try {
     try {
-      await executeChatMessageForSession(
-        sessionId,
+      await executeChatMessageForWorkspace(
         workspace,
+        sessionId,
         userMessagePayload,
+        userMessageText,
         response,
         isClientStillConnected,
-        { forceLocalRun: false, recreateSession: false },
+        { forceLocalRun: false, recreateWorkspaceAgent: false },
       );
     } catch (firstAttemptError) {
       const normalizedError = normalizeThrownError(firstAttemptError);
-      const shouldRecreateSession = isAuthenticationFailure(firstAttemptError);
+      const shouldRecreateWorkspaceAgent = isAuthenticationFailure(firstAttemptError);
       const shouldForceLocalRun = isAgentBusyFailure(firstAttemptError);
 
-      if (!shouldRecreateSession && !shouldForceLocalRun) {
+      if (!shouldRecreateWorkspaceAgent && !shouldForceLocalRun) {
         throw normalizedError;
       }
 
       logServerMessage(
-        `session ${sessionId} retry: recreate=${shouldRecreateSession} force=${shouldForceLocalRun} (${normalizedError.message})`,
+        `workspace ${workspace.id} retry: recreate=${shouldRecreateWorkspaceAgent} force=${shouldForceLocalRun} (${normalizedError.message})`,
       );
 
       if (!isClientStillConnected()) {
         return;
       }
 
-      await executeChatMessageForSession(
-        sessionId,
+      await executeChatMessageForWorkspace(
         workspace,
+        sessionId,
         userMessagePayload,
+        userMessageText,
         response,
         isClientStillConnected,
         {
-          forceLocalRun: shouldForceLocalRun || shouldRecreateSession,
-          recreateSession: shouldRecreateSession,
+          forceLocalRun: shouldForceLocalRun || shouldRecreateWorkspaceAgent,
+          recreateWorkspaceAgent: shouldRecreateWorkspaceAgent,
         },
       );
     }
@@ -704,7 +799,8 @@ application.post("/api/chat", async (request, response) => {
   } catch (error) {
     const normalizedError = normalizeThrownError(error);
     if (isAuthenticationFailure(error)) {
-      await disposeChatSession(sessionId, "authentication failure");
+      await disposeWorkspaceAgent(workspace.id, "authentication failure");
+      await clearPersistedAgentId(workspace.id);
     }
     logServerMessage(`session ${sessionId} chat failed: ${normalizedError.message}`);
     if (isClientStillConnected()) {
@@ -718,11 +814,15 @@ application.post("/api/chat", async (request, response) => {
       response.end();
     }
   } finally {
-    const updatedSession = chatSessions.get(sessionId);
-    if (updatedSession) {
-      updatedSession.busy = false;
-      touchSessionActivity(updatedSession);
-      scheduleSessionIdleDispose(sessionId, updatedSession);
+    const sessionLockRecord = sessionLocks.get(sessionId);
+    if (sessionLockRecord) {
+      sessionLockRecord.busy = false;
+    }
+    const updatedWorkspace = workspaceAgents.get(workspace.id);
+    if (updatedWorkspace) {
+      updatedWorkspace.busy = false;
+      touchWorkspaceActivity(updatedWorkspace);
+      scheduleWorkspaceIdleDispose(workspace.id, updatedWorkspace);
     }
   }
 });
@@ -733,45 +833,63 @@ application.post("/api/new-chat", async (request, response) => {
   const workspace = resolveWorkspace(request.body?.workspaceId);
 
   if (previousSessionId) {
-    const previousSession = chatSessions.get(previousSessionId);
-    if (previousSession?.busy) {
+    const previousLock = sessionLocks.get(previousSessionId);
+    if (previousLock?.busy) {
       response.status(429).json({ error: "Дождитесь окончания текущего ответа." });
       return;
     }
-    await disposeChatSession(previousSessionId, "new chat requested");
+    sessionLocks.delete(previousSessionId);
   }
 
   const newSessionId = randomUUID();
-  response.json({ ok: true, sessionId: newSessionId, workspaceId: workspace.id });
+  response.json({
+    ok: true,
+    sessionId: newSessionId,
+    workspaceId: workspace.id,
+    agentPreserved: workspaceAgents.has(workspace.id),
+  });
 });
 
-application.post("/api/reset-agent", async (request, response) => {
-  const sessionId =
-    typeof request.body?.sessionId === "string" ? normalizeSessionId(request.body.sessionId) : undefined;
-
-  if (sessionId) {
-    const sessionRecord = chatSessions.get(sessionId);
-    if (sessionRecord?.busy) {
-      response.status(429).json({ error: "Дождитесь окончания текущего ответа." });
-      return;
-    }
-    await disposeChatSession(sessionId, "manual reset");
-    response.json({ ok: true, sessionId, disposed: true });
+application.post("/api/reset-memory", async (request, response) => {
+  const workspace = resolveWorkspace(request.body?.workspaceId);
+  const workspaceRecord = workspaceAgents.get(workspace.id);
+  if (workspaceRecord?.busy) {
+    response.status(429).json({ error: "Дождитесь окончания текущего ответа." });
     return;
   }
 
-  const sessionIds = [...chatSessions.keys()];
-  for (const id of sessionIds) {
-    const record = chatSessions.get(id);
-    if (record?.busy) {
-      response.status(429).json({ error: `Сессия ${id} занята. Повторите позже.` });
-      return;
-    }
+  await clearMemoryFile(workspace.path);
+  try {
+    await clearWorkspaceBrain(workspace.id);
+  } catch (brainError) {
+    logServerMessage(
+      `reset-memory supabase: ${brainError instanceof Error ? brainError.message : String(brainError)}`,
+    );
   }
-  for (const id of sessionIds) {
-    await disposeChatSession(id, "reset all");
+  try {
+    await deleteQdrantCollection(workspace.id);
+  } catch (qdrantError) {
+    logServerMessage(
+      `reset-memory qdrant: ${qdrantError instanceof Error ? qdrantError.message : String(qdrantError)}`,
+    );
   }
-  response.json({ ok: true, disposedSessions: sessionIds.length });
+
+  await disposeWorkspaceAgent(workspace.id, "reset memory");
+  await clearPersistedAgentId(workspace.id);
+
+  response.json({ ok: true, workspaceId: workspace.id });
+});
+
+application.post("/api/reset-agent", async (request, response) => {
+  const workspace = resolveWorkspace(request.body?.workspaceId);
+  const workspaceRecord = workspaceAgents.get(workspace.id);
+  if (workspaceRecord?.busy) {
+    response.status(429).json({ error: "Дождитесь окончания текущего ответа." });
+    return;
+  }
+  await disposeWorkspaceAgent(workspace.id, "manual reset");
+  await clearPersistedAgentId(workspace.id);
+  response.json({ ok: true, workspaceId: workspace.id, disposed: true });
 });
 
 application.use(express.static(publicDirPath));
@@ -791,21 +909,27 @@ application.listen(listenPort, () => {
       `MCP at startup: ${configuredMcpServers.map((entry) => entry.id).join(", ")}`,
     );
   }
+  if (isSupabaseBrainEnabled()) {
+    logServerMessage("Brain Supabase: enabled");
+  }
+  if (isQdrantBrainEnabled()) {
+    logServerMessage("Brain Qdrant: enabled");
+  }
 });
 
-async function disposeAllSessionsOnShutdown(): Promise<void> {
-  const sessionIds = [...chatSessions.keys()];
-  for (const sessionId of sessionIds) {
-    await disposeChatSession(sessionId, "shutdown");
+async function disposeAllWorkspaceAgentsOnShutdown(): Promise<void> {
+  const workspaceIds = [...workspaceAgents.keys()];
+  for (const workspaceId of workspaceIds) {
+    await disposeWorkspaceAgent(workspaceId, "shutdown");
   }
 }
 
 process.on("SIGINT", () => {
-  void disposeAllSessionsOnShutdown().finally(() => process.exit(0));
+  void disposeAllWorkspaceAgentsOnShutdown().finally(() => process.exit(0));
 });
 
 process.on("SIGTERM", () => {
-  void disposeAllSessionsOnShutdown().finally(() => process.exit(0));
+  void disposeAllWorkspaceAgentsOnShutdown().finally(() => process.exit(0));
 });
 
 process.on("unhandledRejection", (reason) => {
@@ -813,9 +937,10 @@ process.on("unhandledRejection", (reason) => {
     `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`,
   );
   if (isAuthenticationFailure(reason)) {
-    const sessionIds = [...chatSessions.keys()];
-    for (const sessionId of sessionIds) {
-      void disposeChatSession(sessionId, "unhandled auth rejection");
+    const workspaceIds = [...workspaceAgents.keys()];
+    for (const workspaceId of workspaceIds) {
+      void disposeWorkspaceAgent(workspaceId, "unhandled auth rejection");
+      void clearPersistedAgentId(workspaceId);
     }
   }
 });
