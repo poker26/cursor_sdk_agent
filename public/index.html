@@ -729,7 +729,7 @@
         const shouldAutoSend =
           typeof transcribeBody.autoSend === "boolean" ? transcribeBody.autoSend : voiceAutoSend;
         if (shouldAutoSend) {
-          await postChatStream(recognizedText);
+          await postChatStream(recognizedText, { replyWithSpeechAfterRun: true });
           return;
         }
         inputElement.value = recognizedText;
@@ -998,11 +998,38 @@
         }
       }
 
-      async function postChatStream(presetMessageText) {
+      function findLastAgentMessageBubble() {
+        const agentBubbles = messagesElement.querySelectorAll(".msg.agent");
+        if (agentBubbles.length === 0) {
+          return null;
+        }
+        return agentBubbles[agentBubbles.length - 1];
+      }
+
+      async function autoSpeakLastAgentReply(agentBubbleElement) {
+        if (!voiceEnabled || !agentBubbleElement) {
+          return;
+        }
+        const agentTextElement = getAgentBubbleTextElement(agentBubbleElement);
+        const speakButtonElement = agentBubbleElement.querySelector(".speak-btn");
+        if (!agentTextElement || !speakButtonElement) {
+          return;
+        }
+        const replyText = (agentTextElement.textContent || "").trim();
+        if (!replyText) {
+          return;
+        }
+        await handleSpeakButtonClick(speakButtonElement, agentTextElement);
+      }
+
+      async function postChatStream(presetMessageText, chatStreamOptions) {
         const messageText =
           typeof presetMessageText === "string"
             ? presetMessageText.trim()
             : inputElement.value.trim();
+        const replyWithSpeechAfterRun = Boolean(
+          chatStreamOptions && chatStreamOptions.replyWithSpeechAfterRun,
+        );
         if ((!messageText && pendingAttachments.length === 0) || isRequestInFlight) {
           return;
         }
@@ -1012,6 +1039,7 @@
         currentAgentBubbleElement = null;
         setComposerEnabled(false);
         setStatus("думает…", "busy");
+        let lastRunSucceeded = false;
 
         const attachmentSnapshot = pendingAttachments.slice();
         const displayText =
@@ -1104,10 +1132,11 @@
                         : "✗ " + event.name;
                   appendToolHint(label);
                 } else if (event.kind === "run_finished") {
+                  lastRunSucceeded = event.status !== "error";
                   if (event.status === "error") {
                     appendMessageBubble("error", "Агент завершил run со статусом error");
                     setStatus("ошибка", "error");
-                  } else {
+                  } else if (!replyWithSpeechAfterRun) {
                     setStatus("готов", "");
                   }
                   saveHistoryToStorage();
@@ -1124,12 +1153,19 @@
           }
         }
 
+        const agentBubbleForAutoSpeech =
+          currentAgentBubbleElement || findLastAgentMessageBubble();
+
         isRequestInFlight = false;
-        currentAgentBubbleElement = null;
         setComposerEnabled(true);
-        if (statusPillElement.className !== "error") {
+
+        if (lastRunSucceeded && replyWithSpeechAfterRun && voiceEnabled) {
+          await autoSpeakLastAgentReply(agentBubbleForAutoSpeech);
+        } else if (statusPillElement.className !== "error" && !activeSpeakButtonElement) {
           setStatus("готов", "");
         }
+
+        currentAgentBubbleElement = null;
         inputElement.focus();
       }
 
