@@ -23,9 +23,11 @@ function stripVoiceUnfriendlyProse(text: string): string {
   let prose = text;
 
   prose = prose.replace(
-    /^.*\b(?:уточняю|уточняюсь|перечитываю|проверяю|сейчас|сначала|далее|затем|открою|посмотрю|запрашиваю|обращаюсь|через подключённый exchange|подключённый exchange|через exchange|ews|mcp)\b.*$/gim,
+    /^.*\b(?:уточняю|уточняюсь|перечитываю|проверяю|загружаю|сейчас|сначала|далее|затем|открою|посмотрю|запрашиваю|обращаюсь|через подключённый exchange|подключённый exchange|через exchange|ews|mcp|итог по неделе|ниже список|уточнение по охвату|если под)\b.*$/gim,
     " ",
   );
+  prose = prose.replace(/\bпо (?:вашему )?календарю\b/gi, " ");
+  prose = prose.replace(/\bпо москве\b/gi, " ");
 
   const linksSectionMatch = prose.search(/\b(?:ссылки|ссылка)\s*:/i);
   if (linksSectionMatch !== -1) {

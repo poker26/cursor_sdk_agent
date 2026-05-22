@@ -1042,11 +1042,7 @@
 
       workspaceSelectElement.addEventListener("change", () => {
         persistWorkspaceId(workspaceSelectElement.value);
-        appendSystemNote(
-          "Репозиторий: " +
-            workspaceSelectElement.value +
-            ". Долгосрочная память привязана к workspace; «Новая вкладка» только очищает экран.",
-        );
+        appendSystemNote("Репозиторий: " + workspaceSelectElement.value);
       });
 
       attachButton.addEventListener("click", () => {
@@ -1107,11 +1103,7 @@
           messagesElement.innerHTML = "";
           currentAgentBubbleElement = null;
           localStorage.removeItem(HISTORY_STORAGE_KEY);
-          appendSystemNote(
-            "Новая вкладка · " +
-              (body.workspaceId || selectedWorkspaceId) +
-              (body.agentPreserved ? " · память и агент workspace сохранены" : ""),
-          );
+          appendSystemNote("Новая вкладка");
           setStatus("готов", "");
         } finally {
           setComposerEnabled(true);
@@ -1404,13 +1396,6 @@
         }
         if (historyMessages.length > 0) {
           renderHistoryMessages(historyMessages);
-          appendSystemNote(
-            "История восстановлена (только экран). Долгосрочная память — в memory.md / brain на сервере.",
-          );
-        } else {
-          appendSystemNote(
-            "Продолжение диалога. «Новая вкладка» — новый sessionId без сброса памяти workspace.",
-          );
         }
         setStatus("готов", "");
       }
