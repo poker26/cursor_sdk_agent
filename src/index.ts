@@ -44,6 +44,8 @@ import {
   getVpnHealthUrl,
   probeVpnHealth,
 } from "./vpn-health.js";
+import { getVoicePublicConfig } from "./voice/config.js";
+import { registerVoiceRoutes } from "./voice/routes.js";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
@@ -671,6 +673,7 @@ application.get("/health", (_request, response) => {
       embeddings: isEmbeddingEnabled(),
       embeddingProvider: getEmbeddingProviderLabel(),
     },
+    voice: getVoicePublicConfig(),
   });
 });
 
@@ -700,8 +703,11 @@ application.get("/api/config", (_request, response) => {
       embeddings: isEmbeddingEnabled(),
       embeddingProvider: getEmbeddingProviderLabel(),
     },
+    voice: getVoicePublicConfig(),
   });
 });
+
+registerVoiceRoutes(application);
 
 application.get("/api/vpn-health", async (_request, response) => {
   const probeResult = await probeVpnHealth();

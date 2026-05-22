@@ -246,6 +246,58 @@
         opacity: 0.45;
         cursor: not-allowed;
       }
+      #voice-record {
+        flex-shrink: 0;
+        padding: 0.55rem 0.75rem;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: #21262d;
+        color: #e6edf3;
+        cursor: pointer;
+        font-size: 1.1rem;
+        line-height: 1;
+      }
+      #voice-record:hover:not(:disabled) {
+        background: #30363d;
+      }
+      #voice-record:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      #voice-record.recording {
+        border-color: #8b2e2e;
+        background: rgba(248, 81, 73, 0.2);
+        animation: vpn-blink 1s ease-in-out infinite;
+      }
+      .msg.agent {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+        gap: 0.4rem;
+      }
+      .msg.agent .msg-text {
+        flex: 1 1 auto;
+        min-width: 0;
+        white-space: pre-wrap;
+      }
+      .speak-btn {
+        flex-shrink: 0;
+        font: inherit;
+        font-size: 0.85rem;
+        padding: 0.15rem 0.4rem;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: #21262d;
+        color: #e6edf3;
+        cursor: pointer;
+        align-self: flex-start;
+      }
+      .speak-btn:hover:not(:disabled) {
+        background: #30363d;
+      }
+      .speak-btn:disabled {
+        opacity: 0.45;
+      }
     </style>
   </head>
   <body>
@@ -275,6 +327,14 @@
     <footer>
       <div id="attach-list" class="attach-list"></div>
       <div id="composer">
+        <button
+          type="button"
+          id="voice-record"
+          hidden
+          title="Голос: нажмите — запись, ещё раз — стоп и отправить"
+        >
+          🎤
+        </button>
         <textarea id="input" rows="2" placeholder="Сообщение… (Enter — отправить)"></textarea>
         <div id="composer-side">
           <input type="file" id="attach-input" multiple />
@@ -299,6 +359,7 @@
       const workspaceSelectElement = document.getElementById("workspace-select");
       const statusPillElement = document.getElementById("status-pill");
       const vpnIndicatorElement = document.getElementById("vpn-indicator");
+      const voiceRecordButton = document.getElementById("voice-record");
 
       let chatSessionId = localStorage.getItem(SESSION_STORAGE_KEY) || "";
       let selectedWorkspaceId = localStorage.getItem(WORKSPACE_STORAGE_KEY) || "";
@@ -308,6 +369,12 @@
       let pendingAttachments = [];
       let vpnHealthPollIntervalMs = 20000;
       let vpnHealthPollTimer = null;
+      let voiceEnabled = false;
+      let voiceAutoSend = true;
+      let voiceMediaRecorder = null;
+      let voiceRecordedChunks = [];
+      let isVoiceRecording = false;
+      let currentSpeechAudio = null;
 
       function persistSessionId(sessionId) {
         chatSessionId = sessionId;
@@ -400,7 +467,11 @@
           if (roleClass === "system") {
             continue;
           }
-          messages.push({ role: roleClass, text: node.textContent || "" });
+          const savedTextElement = node.querySelector(".msg-text");
+          messages.push({
+            role: roleClass,
+            text: savedTextElement ? savedTextElement.textContent || "" : node.textContent || "",
+          });
         }
         localStorage.setItem(
           HISTORY_STORAGE_KEY,
@@ -413,7 +484,10 @@
         currentAgentBubbleElement = null;
         for (const entry of messages) {
           if (entry.role === "agent" && currentAgentBubbleElement) {
-            currentAgentBubbleElement.textContent += entry.text;
+            const historyTextElement = getAgentBubbleTextElement(currentAgentBubbleElement);
+            if (historyTextElement) {
+              historyTextElement.textContent += entry.text;
+            }
           } else {
             currentAgentBubbleElement = null;
             appendMessageBubble(entry.role, entry.text);
@@ -425,10 +499,227 @@
         currentAgentBubbleElement = null;
       }
 
+      function getAgentBubbleTextElement(agentBubbleElement) {
+        if (!agentBubbleElement) {
+          return null;
+        }
+        return agentBubbleElement.querySelector(".msg-text") || agentBubbleElement;
+      }
+
+      function stopCurrentSpeechPlayback() {
+        if (currentSpeechAudio) {
+          currentSpeechAudio.pause();
+          currentSpeechAudio = null;
+        }
+      }
+
+      async function playSpeechForText(textToSpeak) {
+        const trimmedText = (textToSpeak || "").trim();
+        if (!trimmedText || !voiceEnabled) {
+          return;
+        }
+        stopCurrentSpeechPlayback();
+        setStatus("озвучивание…", "busy");
+        try {
+          const synthesizeResponse = await fetch("/api/voice/synthesize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: trimmedText }),
+          });
+          if (!synthesizeResponse.ok) {
+            const errorPayload = await synthesizeResponse.json().catch(() => ({}));
+            appendMessageBubble(
+              "error",
+              errorPayload.error || "Не удалось синтезировать речь",
+            );
+            setStatus("ошибка", "error");
+            return;
+          }
+          const audioBlob = await synthesizeResponse.blob();
+          const objectUrl = URL.createObjectURL(audioBlob);
+          const audioElement = new Audio(objectUrl);
+          currentSpeechAudio = audioElement;
+          audioElement.onended = () => {
+            URL.revokeObjectURL(objectUrl);
+            if (currentSpeechAudio === audioElement) {
+              currentSpeechAudio = null;
+            }
+            if (!isRequestInFlight) {
+              setStatus("готов", "");
+            }
+          };
+          await audioElement.play();
+          if (!isRequestInFlight) {
+            setStatus("готов", "");
+          }
+        } catch (playbackError) {
+          appendMessageBubble(
+            "error",
+            playbackError instanceof Error ? playbackError.message : "Ошибка воспроизведения",
+          );
+          setStatus("ошибка", "error");
+        }
+      }
+
+      function pickVoiceRecordingMimeType() {
+        const mimeCandidates = [
+          "audio/ogg;codecs=opus",
+          "audio/webm;codecs=opus",
+          "audio/webm",
+        ];
+        for (const mimeCandidate of mimeCandidates) {
+          if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mimeCandidate)) {
+            return mimeCandidate;
+          }
+        }
+        return "";
+      }
+
+      function blobToBase64(audioBlob) {
+        return new Promise((resolve, reject) => {
+          const fileReader = new FileReader();
+          fileReader.onload = () => {
+            const dataUrl = String(fileReader.result || "");
+            const commaIndex = dataUrl.indexOf(",");
+            resolve(commaIndex === -1 ? "" : dataUrl.slice(commaIndex + 1));
+          };
+          fileReader.onerror = () => reject(fileReader.error);
+          fileReader.readAsDataURL(audioBlob);
+        });
+      }
+
+      async function transcribeAndSendVoiceRecording() {
+        if (voiceRecordedChunks.length === 0) {
+          appendMessageBubble("error", "Запись пустая. Повторите.");
+          return;
+        }
+        const recordingMimeType =
+          voiceMediaRecorder && voiceMediaRecorder.mimeType
+            ? voiceMediaRecorder.mimeType
+            : "audio/webm";
+        const audioBlob = new Blob(voiceRecordedChunks, { type: recordingMimeType });
+        voiceRecordedChunks = [];
+        if (audioBlob.size > uploadMaxBytes) {
+          appendMessageBubble("error", "Голосовая запись слишком длинная.");
+          return;
+        }
+        setStatus("распознаю…", "busy");
+        const audioBase64 = await blobToBase64(audioBlob);
+        const transcribeResponse = await fetch("/api/voice/transcribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            audioBase64,
+            mimeType: recordingMimeType,
+            filename: recordingMimeType.includes("ogg") ? "voice.ogg" : "voice.webm",
+          }),
+        });
+        const transcribeBody = await transcribeResponse.json();
+        if (!transcribeResponse.ok) {
+          appendMessageBubble("error", transcribeBody.error || "Ошибка распознавания речи");
+          setStatus("ошибка", "error");
+          return;
+        }
+        const recognizedText = (transcribeBody.text || "").trim();
+        if (!recognizedText) {
+          appendMessageBubble("error", "Пустой текст после распознавания.");
+          setStatus("готов", "");
+          return;
+        }
+        const shouldAutoSend =
+          typeof transcribeBody.autoSend === "boolean" ? transcribeBody.autoSend : voiceAutoSend;
+        if (shouldAutoSend) {
+          await postChatStream(recognizedText);
+          return;
+        }
+        inputElement.value = recognizedText;
+        setStatus("готов", "");
+      }
+
+      async function startVoiceRecording() {
+        if (!voiceEnabled || isRequestInFlight || isVoiceRecording) {
+          return;
+        }
+        stopCurrentSpeechPlayback();
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          appendMessageBubble("error", "Микрофон недоступен (нужен HTTPS).");
+          return;
+        }
+        const recordingMimeType = pickVoiceRecordingMimeType();
+        if (!recordingMimeType) {
+          appendMessageBubble("error", "Браузер не поддерживает запись аудио.");
+          return;
+        }
+        const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        voiceRecordedChunks = [];
+        voiceMediaRecorder = new MediaRecorder(mediaStream, { mimeType: recordingMimeType });
+        voiceMediaRecorder.ondataavailable = (recorderEvent) => {
+          if (recorderEvent.data && recorderEvent.data.size > 0) {
+            voiceRecordedChunks.push(recorderEvent.data);
+          }
+        };
+        voiceMediaRecorder.onstop = () => {
+          for (const mediaTrack of mediaStream.getTracks()) {
+            mediaTrack.stop();
+          }
+          void transcribeAndSendVoiceRecording();
+        };
+        voiceMediaRecorder.start();
+        isVoiceRecording = true;
+        voiceRecordButton.classList.add("recording");
+        voiceRecordButton.title = "Идёт запись… Нажмите для остановки и отправки";
+        setStatus("запись…", "busy");
+      }
+
+      function stopVoiceRecording() {
+        if (!isVoiceRecording || !voiceMediaRecorder) {
+          return;
+        }
+        isVoiceRecording = false;
+        voiceRecordButton.classList.remove("recording");
+        voiceRecordButton.title =
+          "Голос: нажмите — запись, ещё раз — стоп и отправить";
+        if (voiceMediaRecorder.state !== "inactive") {
+          voiceMediaRecorder.stop();
+        }
+      }
+
+      async function toggleVoiceRecording() {
+        if (isVoiceRecording) {
+          stopVoiceRecording();
+          return;
+        }
+        try {
+          await startVoiceRecording();
+        } catch (microphoneError) {
+          appendMessageBubble(
+            "error",
+            microphoneError instanceof Error
+              ? microphoneError.message
+              : "Не удалось открыть микрофон",
+          );
+          setStatus("ошибка", "error");
+        }
+      }
+
       function appendMessageBubble(role, text) {
         const bubbleElement = document.createElement("div");
         bubbleElement.className = "msg " + role;
-        bubbleElement.textContent = text;
+        const textElement = document.createElement("span");
+        textElement.className = "msg-text";
+        textElement.textContent = text;
+        bubbleElement.appendChild(textElement);
+        if (role === "agent" && voiceEnabled) {
+          const speakButtonElement = document.createElement("button");
+          speakButtonElement.type = "button";
+          speakButtonElement.className = "speak-btn";
+          speakButtonElement.title = "Озвучить ответ";
+          speakButtonElement.textContent = "🔊";
+          speakButtonElement.addEventListener("click", () => {
+            void playSpeechForText(textElement.textContent || "");
+          });
+          bubbleElement.appendChild(speakButtonElement);
+        }
         messagesElement.appendChild(bubbleElement);
         scrollMessagesToBottom();
         saveHistoryToStorage();
@@ -448,6 +739,20 @@
         if (!currentAgentBubbleElement) {
           currentAgentBubbleElement = document.createElement("div");
           currentAgentBubbleElement.className = "msg agent";
+          const textElement = document.createElement("span");
+          textElement.className = "msg-text";
+          currentAgentBubbleElement.appendChild(textElement);
+          if (voiceEnabled) {
+            const speakButtonElement = document.createElement("button");
+            speakButtonElement.type = "button";
+            speakButtonElement.className = "speak-btn";
+            speakButtonElement.title = "Озвучить ответ";
+            speakButtonElement.textContent = "🔊";
+            speakButtonElement.addEventListener("click", () => {
+              void playSpeechForText(textElement.textContent || "");
+            });
+            currentAgentBubbleElement.appendChild(speakButtonElement);
+          }
           messagesElement.appendChild(currentAgentBubbleElement);
         }
         return currentAgentBubbleElement;
@@ -479,6 +784,9 @@
         attachButton.disabled = !enabled;
         inputElement.disabled = !enabled;
         workspaceSelectElement.disabled = !enabled || isRequestInFlight;
+        if (voiceEnabled) {
+          voiceRecordButton.disabled = !enabled;
+        }
       }
 
       async function loadServerConfig() {
@@ -504,6 +812,14 @@
         }
         if (config.vpnHealth && config.vpnHealth.pollIntervalMs) {
           vpnHealthPollIntervalMs = config.vpnHealth.pollIntervalMs;
+        }
+        if (config.voice && config.voice.enabled) {
+          voiceEnabled = true;
+          voiceAutoSend = config.voice.autoSend !== false;
+          voiceRecordButton.hidden = false;
+        } else {
+          voiceEnabled = false;
+          voiceRecordButton.hidden = true;
         }
       }
 
@@ -586,12 +902,16 @@
         }
       }
 
-      async function postChatStream() {
-        const messageText = inputElement.value.trim();
+      async function postChatStream(presetMessageText) {
+        const messageText =
+          typeof presetMessageText === "string"
+            ? presetMessageText.trim()
+            : inputElement.value.trim();
         if ((!messageText && pendingAttachments.length === 0) || isRequestInFlight) {
           return;
         }
 
+        stopCurrentSpeechPlayback();
         isRequestInFlight = true;
         currentAgentBubbleElement = null;
         setComposerEnabled(false);
@@ -604,7 +924,9 @@
             ? "\n\n📎 " + attachmentSnapshot.map((item) => item.filename).join(", ")
             : "");
         appendMessageBubble("user", displayText);
-        inputElement.value = "";
+        if (typeof presetMessageText !== "string") {
+          inputElement.value = "";
+        }
         pendingAttachments = [];
         renderAttachmentChips();
 
@@ -671,7 +993,10 @@
                   persistWorkspaceId(event.workspaceId);
                 } else if (event.kind === "assistant_text") {
                   const agentBubble = ensureAgentBubble();
-                  agentBubble.textContent += event.text;
+                  const agentTextElement = getAgentBubbleTextElement(agentBubble);
+                  if (agentTextElement) {
+                    agentTextElement.textContent += event.text;
+                  }
                   scrollMessagesToBottom();
                   saveHistoryToStorage();
                 } else if (event.kind === "tool_call") {
@@ -714,6 +1039,10 @@
 
       sendButton.addEventListener("click", () => {
         void postChatStream();
+      });
+
+      voiceRecordButton.addEventListener("click", () => {
+        void toggleVoiceRecording();
       });
 
       newChatButton.addEventListener("click", () => {
