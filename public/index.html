@@ -729,7 +729,10 @@
         const shouldAutoSend =
           typeof transcribeBody.autoSend === "boolean" ? transcribeBody.autoSend : voiceAutoSend;
         if (shouldAutoSend) {
-          await postChatStream(recognizedText, { replyWithSpeechAfterRun: true });
+          await postChatStream(recognizedText, {
+            replyWithSpeechAfterRun: true,
+            responseMode: "voice",
+          });
           return;
         }
         inputElement.value = recognizedText;
@@ -1030,6 +1033,10 @@
         const replyWithSpeechAfterRun = Boolean(
           chatStreamOptions && chatStreamOptions.replyWithSpeechAfterRun,
         );
+        const chatResponseMode =
+          chatStreamOptions && chatStreamOptions.responseMode === "voice"
+            ? "voice"
+            : "text";
         if ((!messageText && pendingAttachments.length === 0) || isRequestInFlight) {
           return;
         }
@@ -1062,6 +1069,7 @@
             sessionId: chatSessionId || undefined,
             workspaceId: workspaceSelectElement.value || selectedWorkspaceId,
             attachments: attachmentSnapshot,
+            responseMode: chatResponseMode,
           }),
         });
 

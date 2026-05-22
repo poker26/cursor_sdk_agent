@@ -42,8 +42,12 @@ export function prepareTextForSpeechSynthesis(rawText: string): string {
   cleanedText = cleanedText.replace(/^\s*[-*+]\s+/gm, "");
   cleanedText = cleanedText.replace(/^\s*\d+\.\s+/gm, "");
   cleanedText = cleanedText.replace(/^[-*_]{3,}\s*$/gm, " ");
+  cleanedText = cleanedText.replace(/^\s*\|.*\|\s*$/gm, " ");
+  cleanedText = cleanedText.replace(/^\s*\|?[-:|\s]+\|?\s*$/gm, " ");
 
   cleanedText = cleanedText.replace(/^[▶✓✗]\s+\S+.*$/gm, " ");
+  cleanedText = cleanedText.replace(/^\(.*UTC.*\)\s*$/gim, " ");
+  cleanedText = cleanedText.replace(/Meeting ID|Passcode|сводка по/gi, " ");
 
   cleanedText = cleanedText.replace(/<[^>]+>/g, " ");
 

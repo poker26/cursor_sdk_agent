@@ -46,6 +46,11 @@ import {
 } from "./vpn-health.js";
 import { getVoicePublicConfig } from "./voice/config.js";
 import { registerVoiceRoutes } from "./voice/routes.js";
+import {
+  buildChatResponseStylePrefix,
+  parseChatResponseMode,
+  type ChatResponseMode,
+} from "./chat-response-style.js";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
@@ -613,7 +618,11 @@ async function executeChatMessageForWorkspace(
   userMessageText: string,
   response: express.Response,
   isClientStillConnected: () => boolean,
-  options: { forceLocalRun: boolean; recreateWorkspaceAgent: boolean },
+  options: {
+    forceLocalRun: boolean;
+    recreateWorkspaceAgent: boolean;
+    responseMode: ChatResponseMode;
+  },
 ): Promise<void> {
   if (options.recreateWorkspaceAgent) {
     await disposeWorkspaceAgent(workspace.id, "recreate before retry");
@@ -621,12 +630,19 @@ async function executeChatMessageForWorkspace(
   }
 
   const workspaceRecord = await getOrCreateWorkspaceAgent(workspace);
+  const stylePrefix = buildChatResponseStylePrefix(options.responseMode);
   const brainPrefix = await buildBrainContextPrefix({
     workspaceId: workspace.id,
     workspacePath: workspace.path,
     userMessageText,
   });
-  const payloadWithBrain = prependTextToUserPayload(userMessagePayload, brainPrefix);
+  const combinedContextPrefix = [stylePrefix, brainPrefix]
+    .filter((section) => section.trim().length > 0)
+    .join("");
+  const payloadWithBrain = prependTextToUserPayload(
+    userMessagePayload,
+    combinedContextPrefix,
+  );
 
   const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
   const agentRun = await workspaceRecord.agent.send(payloadWithBrain, sendOptions);
@@ -718,6 +734,7 @@ application.post("/api/chat", async (request, response) => {
   const sessionId = normalizeSessionId(request.body?.sessionId);
   const workspace = resolveWorkspace(request.body?.workspaceId);
   const userMessageText = typeof request.body?.message === "string" ? request.body.message : "";
+  const responseMode = parseChatResponseMode(request.body?.responseMode);
   const attachments = parseClientAttachments(request.body?.attachments);
 
   if (!userMessageText.trim() && attachments.length === 0) {
@@ -789,7 +806,7 @@ application.post("/api/chat", async (request, response) => {
         userMessageText,
         response,
         isClientStillConnected,
-        { forceLocalRun: false, recreateWorkspaceAgent: false },
+        { forceLocalRun: false, recreateWorkspaceAgent: false, responseMode },
       );
     } catch (firstAttemptError) {
       const normalizedError = normalizeThrownError(firstAttemptError);
@@ -818,6 +835,7 @@ application.post("/api/chat", async (request, response) => {
         {
           forceLocalRun: shouldForceLocalRun || shouldRecreateWorkspaceAgent,
           recreateWorkspaceAgent: shouldRecreateWorkspaceAgent,
+          responseMode,
         },
       );
     }
