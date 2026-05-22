@@ -22,7 +22,15 @@ const CHAT_UI_BASE_STYLE = `[Стиль ответа в веб-чате — об
 7. Русский, коротко. Обычно 1–4 предложения; список — только если явно просили детализацию.
 
 Пример (пересечения на неделе 26.05–01.06):
-«На неделе одно пересечение: вторник 26.05, 12:00–13:00 — Дейли и Василий. В остальные дни пересечений нет.»`;
+«На неделе одно пересечение: вторник 26.05, 12:00–13:00 — Дейли и Василий. В остальные дни пересечений нет.»
+
+Нарушение (так НЕЛЬЗЯ):
+«Запрашиваю календарь через Exchange… **Одно пересечение…** Для краткой сводки: неделя взята как 25.05–31.05»`;
+
+const CHAT_RESPONSE_STYLE_SUFFIX = `
+
+---
+[Жёстко: ответ = 1–3 предложения, только факт на вопрос. Ноль слов про Exchange/запрос/диапазон в конце.]`;
 
 const CHAT_UI_VOICE_EXTRA_STYLE = `[Голосовой запрос]
 
@@ -42,4 +50,8 @@ export function buildChatResponseStylePrefix(responseMode: ChatResponseMode): st
     return `${CHAT_UI_BASE_STYLE}\n\n${CHAT_UI_VOICE_EXTRA_STYLE}\n\n---\n\n`;
   }
   return `${CHAT_UI_BASE_STYLE}\n\n---\n\n`;
+}
+
+export function buildChatResponseStyleSuffix(): string {
+  return CHAT_RESPONSE_STYLE_SUFFIX;
 }

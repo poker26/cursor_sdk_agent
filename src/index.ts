@@ -48,9 +48,11 @@ import { getVoicePublicConfig } from "./voice/config.js";
 import { registerVoiceRoutes } from "./voice/routes.js";
 import {
   buildChatResponseStylePrefix,
+  buildChatResponseStyleSuffix,
   parseChatResponseMode,
   type ChatResponseMode,
 } from "./chat-response-style.js";
+import { sanitizeAssistantResponseForChat } from "./assistant-response-sanitize.js";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
@@ -646,6 +648,22 @@ function prependTextToUserPayload(
   };
 }
 
+function appendTextToUserPayload(
+  userMessagePayload: string | SDKUserMessage,
+  suffix: string,
+): string | SDKUserMessage {
+  if (!suffix.trim()) {
+    return userMessagePayload;
+  }
+  if (typeof userMessagePayload === "string") {
+    return `${userMessagePayload}${suffix}`;
+  }
+  return {
+    ...userMessagePayload,
+    text: `${userMessagePayload.text ?? ""}${suffix}`,
+  };
+}
+
 async function executeChatMessageForWorkspace(
   workspace: WorkspaceEntry,
   sessionId: string,
@@ -674,10 +692,12 @@ async function executeChatMessageForWorkspace(
   const combinedContextPrefix = [stylePrefix, brainPrefix]
     .filter((section) => section.trim().length > 0)
     .join("");
-  const payloadWithBrain = prependTextToUserPayload(
+  const styleSuffix = buildChatResponseStyleSuffix();
+  const payloadWithContext = prependTextToUserPayload(
     userMessagePayload,
     combinedContextPrefix,
   );
+  const payloadWithBrain = appendTextToUserPayload(payloadWithContext, styleSuffix);
 
   const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
   const agentRun = await workspaceRecord.agent.send(payloadWithBrain, sendOptions);
@@ -692,13 +712,25 @@ async function executeChatMessageForWorkspace(
     },
   );
 
+  const sanitizedAssistantText = sanitizeAssistantResponseForChat(assistantAccumulatedText);
+  if (
+    sanitizedAssistantText &&
+    sanitizedAssistantText !== assistantAccumulatedText &&
+    isClientStillConnected()
+  ) {
+    writeSseDataLine(response, {
+      kind: "assistant_text_final",
+      text: sanitizedAssistantText,
+    });
+  }
+
   if (runOutcome.status !== "error" && isClientStillConnected()) {
     try {
       await persistBrainAfterRun({
         workspaceId: workspace.id,
         workspacePath: workspace.path,
         userMessageText,
-        assistantMessageText: assistantAccumulatedText,
+        assistantMessageText: sanitizedAssistantText || assistantAccumulatedText,
         runId: runOutcome.runId,
         runStatus: runOutcome.status,
       });

@@ -1241,6 +1241,15 @@
                   }
                   scrollMessagesToBottom();
                   saveHistoryToStorage();
+                } else if (event.kind === "assistant_text_final") {
+                  const agentBubble =
+                    currentAgentBubbleElement || findLastAgentMessageBubble();
+                  const agentTextElement = getAgentBubbleTextElement(agentBubble);
+                  if (agentTextElement && event.text) {
+                    agentTextElement.textContent = event.text;
+                  }
+                  scrollMessagesToBottom();
+                  saveHistoryToStorage();
                 } else if (event.kind === "tool_call") {
                   const label =
                     event.status === "running"
