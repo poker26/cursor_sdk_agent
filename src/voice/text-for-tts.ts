@@ -18,11 +18,37 @@ function stripUrlsFromTextForSpeech(text: string): string {
   return withoutUrls;
 }
 
+/** Убирает преамбулы и блоки ссылок, которые портят озвучку. */
+function stripVoiceUnfriendlyProse(text: string): string {
+  let prose = text;
+
+  prose = prose.replace(
+    /^.*\b(?:уточняю|перечитываю|сейчас открою|через подключённый exchange|подключённый exchange)\b.*$/gim,
+    " ",
+  );
+
+  const linksSectionMatch = prose.search(/\b(?:ссылки|ссылка)\s*:/i);
+  if (linksSectionMatch !== -1) {
+    prose = prose.slice(0, linksSectionMatch);
+  }
+
+  prose = prose.replace(
+    /\b(?:посмотрите|откройте)\s+(?:поле\s+)?(?:место|ссылку).+$/gim,
+    " ",
+  );
+  prose = prose.replace(/телемост\s+яндекс\s+[^\n.]{8,}/gi, " Телемост ");
+  prose = prose.replace(/zoom\s+как\s+в\s+месте\s+встречи[^\n.]*/gi, " Zoom ");
+
+  return prose;
+}
+
 /**
  * Убирает markdown и служебный шум перед Yandex TTS — диктор читает связный текст.
  */
 export function prepareTextForSpeechSynthesis(rawText: string): string {
   let cleanedText = rawText.replace(/\r\n/g, "\n");
+
+  cleanedText = stripVoiceUnfriendlyProse(cleanedText);
 
   cleanedText = cleanedText.replace(/```[\s\S]*?```/g, " ");
   cleanedText = cleanedText.replace(/`[^`\n]+`/g, " ");
@@ -56,6 +82,8 @@ export function prepareTextForSpeechSynthesis(rawText: string): string {
   cleanedText = cleanedText.replace(/[#*_~`|\\[\]{}]/g, " ");
 
   cleanedText = stripUrlsFromTextForSpeech(cleanedText);
+  cleanedText = stripVoiceUnfriendlyProse(cleanedText);
+  cleanedText = cleanedText.replace(/\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/gi, " ");
   cleanedText = cleanedText.replace(/\s+/g, " ");
   cleanedText = cleanedText.replace(/\n+/g, ". ");
 
