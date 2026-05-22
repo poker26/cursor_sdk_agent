@@ -10,6 +10,12 @@ const TRAILING_LINE_PATTERN =
 const TRAILING_CONTENT_PATTERN =
   /(?:для краткой сводки|взята как|пн[–-]вс\s+после|следующая\s+(?:календарная\s+)?неделя\s+взята|уточнение\s+по\s+охвату)/i;
 
+const INLINE_META_TAIL_PATTERN =
+  /\s[—–]\s*(?:по блоку|в выгрузке|из выгрузки|по списку|согласно|из файла|в файле|\/~\/\.cursor-agent|\.cursor-agent\/|confluence_pp|без строк|исключ\w*|руководитель направления).+$/i;
+
+const SOURCE_META_PARAGRAPH_PATTERN =
+  /(?:^|\s)(?:по блоку|в выгрузке|из выгрузки|взято из|источник:|согласно файлу)/i;
+
 function splitIntoParagraphs(text: string): string[] {
   return text
     .split(/\n\s*\n/)
@@ -30,11 +36,31 @@ function isTrailingMetaParagraph(paragraph: string): boolean {
   if (TRAILING_LINE_PATTERN.test(firstLine)) {
     return true;
   }
-  return TRAILING_CONTENT_PATTERN.test(paragraph);
+  if (TRAILING_CONTENT_PATTERN.test(paragraph)) {
+    return true;
+  }
+  if (SOURCE_META_PARAGRAPH_PATTERN.test(paragraph) && !/@\w+\.\w+/.test(paragraph)) {
+    return true;
+  }
+  return false;
+}
+
+function stripInlineMetaTail(paragraph: string): string {
+  let cleaned = paragraph;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const metaTailMatch = INLINE_META_TAIL_PATTERN.exec(cleaned);
+    if (!metaTailMatch || metaTailMatch.index === undefined) {
+      break;
+    }
+    cleaned = cleaned.slice(0, metaTailMatch.index).trim();
+  }
+  return cleaned;
 }
 
 function normalizeParagraphText(paragraph: string): string {
-  return paragraph.replace(/\*\*/g, "").replace(/\s+/g, " ").trim();
+  const withoutBold = paragraph.replace(/\*\*/g, "").replace(/`/g, "");
+  const withoutMetaTail = stripInlineMetaTail(withoutBold);
+  return withoutMetaTail.replace(/\s+/g, " ").trim();
 }
 
 /**
