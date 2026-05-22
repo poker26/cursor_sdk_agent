@@ -1,3 +1,23 @@
+/** Удаляет URL и похожие фрагменты — диктор их не читает. */
+function stripUrlsFromTextForSpeech(text: string): string {
+  let withoutUrls = text;
+
+  const urlPatterns = [
+    /(?:https?|ftp|mailto):\/\/[^\s<>"'`,)\]]+/gi,
+    /<\s*(?:https?|ftp|mailto):\/\/[^>]+>/gi,
+    /\bwww\.[^\s<>"'`,)\]]+/gi,
+    /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?:\/[^\s<>"'`,)\]]*)?/gi,
+    /\b[a-z0-9][-a-z0-9]*(?:\.[a-z0-9][-a-z0-9]*)*\.[a-z]{2,}(?::\d{1,5})(?:\/[^\s<>"'`,)\]]*)?/gi,
+    /\b[a-z0-9][-a-z0-9]*(?:\.[a-z0-9][-a-z0-9]*)*\.[a-z]{2,}\/[^\s<>"'`,)\]]+/gi,
+  ];
+
+  for (const urlPattern of urlPatterns) {
+    withoutUrls = withoutUrls.replace(urlPattern, " ");
+  }
+
+  return withoutUrls;
+}
+
 /**
  * Убирает markdown и служебный шум перед Yandex TTS — диктор читает связный текст.
  */
@@ -26,9 +46,12 @@ export function prepareTextForSpeechSynthesis(rawText: string): string {
   cleanedText = cleanedText.replace(/^[▶✓✗]\s+\S+.*$/gm, " ");
 
   cleanedText = cleanedText.replace(/<[^>]+>/g, " ");
-  cleanedText = cleanedText.replace(/https?:\/\/\S+/gi, " ");
+
+  cleanedText = stripUrlsFromTextForSpeech(cleanedText);
 
   cleanedText = cleanedText.replace(/[#*_~`|\\[\]{}]/g, " ");
+
+  cleanedText = stripUrlsFromTextForSpeech(cleanedText);
   cleanedText = cleanedText.replace(/\s+/g, " ");
   cleanedText = cleanedText.replace(/\n+/g, ". ");
 
