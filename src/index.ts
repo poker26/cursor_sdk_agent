@@ -160,7 +160,38 @@ function isAgentBusyFailure(error: unknown): boolean {
   if (error instanceof AgentBusyError) {
     return true;
   }
-  return convertError(error) instanceof AgentBusyError;
+  if (convertError(error) instanceof AgentBusyError) {
+    return true;
+  }
+  const errorMessage =
+    error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return /already has active run/i.test(errorMessage);
+}
+
+function clearSessionLocksForWorkspace(workspaceId: string): number {
+  let clearedCount = 0;
+  for (const [sessionId, sessionLock] of sessionLocks.entries()) {
+    if (sessionLock.workspaceId === workspaceId) {
+      sessionLocks.delete(sessionId);
+      clearedCount += 1;
+    }
+  }
+  return clearedCount;
+}
+
+async function recoverStuckWorkspaceAgent(workspaceId: string, reason: string): Promise<void> {
+  const clearedLocks = clearSessionLocksForWorkspace(workspaceId);
+  const workspaceRecord = workspaceAgents.get(workspaceId);
+  if (workspaceRecord) {
+    workspaceRecord.busy = false;
+  }
+  await disposeWorkspaceAgent(workspaceId, reason);
+  await clearPersistedAgentId(workspaceId);
+  if (clearedLocks > 0) {
+    logServerMessage(
+      `workspace ${workspaceId} cleared ${clearedLocks} session lock(s) (${reason})`,
+    );
+  }
 }
 
 function normalizeThrownError(error: unknown): Error {
@@ -810,11 +841,20 @@ application.post("/api/chat", async (request, response) => {
       );
     } catch (firstAttemptError) {
       const normalizedError = normalizeThrownError(firstAttemptError);
-      const shouldRecreateWorkspaceAgent = isAuthenticationFailure(firstAttemptError);
-      const shouldForceLocalRun = isAgentBusyFailure(firstAttemptError);
+      const agentIsBusy = isAgentBusyFailure(firstAttemptError);
+      const shouldRecreateWorkspaceAgent =
+        isAuthenticationFailure(firstAttemptError) || agentIsBusy;
+      const shouldForceLocalRun = agentIsBusy || shouldRecreateWorkspaceAgent;
 
       if (!shouldRecreateWorkspaceAgent && !shouldForceLocalRun) {
         throw normalizedError;
+      }
+
+      if (agentIsBusy) {
+        await recoverStuckWorkspaceAgent(
+          workspace.id,
+          "active run conflict before retry",
+        );
       }
 
       logServerMessage(
@@ -846,8 +886,9 @@ application.post("/api/chat", async (request, response) => {
   } catch (error) {
     const normalizedError = normalizeThrownError(error);
     if (isAuthenticationFailure(error)) {
-      await disposeWorkspaceAgent(workspace.id, "authentication failure");
-      await clearPersistedAgentId(workspace.id);
+      await recoverStuckWorkspaceAgent(workspace.id, "authentication failure");
+    } else if (isAgentBusyFailure(error)) {
+      await recoverStuckWorkspaceAgent(workspace.id, "active run conflict after retry");
     }
     logServerMessage(`session ${sessionId} chat failed: ${normalizedError.message}`);
     if (isClientStillConnected()) {
@@ -929,14 +970,26 @@ application.post("/api/reset-memory", async (request, response) => {
 
 application.post("/api/reset-agent", async (request, response) => {
   const workspace = resolveWorkspace(request.body?.workspaceId);
+  const forceReset = request.body?.force === true;
   const workspaceRecord = workspaceAgents.get(workspace.id);
-  if (workspaceRecord?.busy) {
-    response.status(429).json({ error: "Дождитесь окончания текущего ответа." });
+  if (workspaceRecord?.busy && !forceReset) {
+    response.status(429).json({
+      error:
+        "Дождитесь окончания текущего ответа или вызовите сброс с force: true.",
+    });
     return;
   }
-  await disposeWorkspaceAgent(workspace.id, "manual reset");
-  await clearPersistedAgentId(workspace.id);
-  response.json({ ok: true, workspaceId: workspace.id, disposed: true });
+  await recoverStuckWorkspaceAgent(
+    workspace.id,
+    forceReset ? "manual force reset" : "manual reset",
+  );
+  response.json({
+    ok: true,
+    workspaceId: workspace.id,
+    disposed: true,
+    force: forceReset,
+    newAgentOnNextMessage: true,
+  });
 });
 
 application.use(express.static(publicDirPath));

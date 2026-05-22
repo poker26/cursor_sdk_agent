@@ -329,6 +329,7 @@
       <div class="toolbar">
         <button type="button" id="attach-btn" title="Прикрепить файл">📎</button>
         <button type="button" id="new-chat" title="Новая вкладка UI, память workspace сохраняется">Новая вкладка</button>
+        <button type="button" id="reset-agent" title="Сбросить зависший агент (active run) без удаления памяти">Сбросить агента</button>
         <button type="button" id="reset-memory" title="Очистить memory.md, Supabase, Qdrant и пересоздать агента">Сбросить память</button>
       </div>
     </header>
@@ -363,6 +364,7 @@
       const inputElement = document.getElementById("input");
       const sendButton = document.getElementById("send");
       const newChatButton = document.getElementById("new-chat");
+      const resetAgentButton = document.getElementById("reset-agent");
       const resetMemoryButton = document.getElementById("reset-memory");
       const attachButton = document.getElementById("attach-btn");
       const attachInputElement = document.getElementById("attach-input");
@@ -879,6 +881,7 @@
       function setComposerEnabled(enabled) {
         sendButton.disabled = !enabled;
         newChatButton.disabled = !enabled;
+        resetAgentButton.disabled = !enabled;
         resetMemoryButton.disabled = !enabled;
         attachButton.disabled = !enabled;
         inputElement.disabled = !enabled;
@@ -1220,6 +1223,50 @@
           setComposerEnabled(true);
         }
       }
+
+      async function resetWorkspaceAgent(forceReset) {
+        if (isRequestInFlight && !forceReset) {
+          return;
+        }
+        if (
+          !confirm(
+            forceReset
+              ? "Принудительно сбросить агента? (память сохранится)"
+              : "Сбросить агента workspace? (память сохранится)",
+          )
+        ) {
+          return;
+        }
+        setComposerEnabled(false);
+        try {
+          const response = await fetch("/api/reset-agent", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              workspaceId: workspaceSelectElement.value || selectedWorkspaceId,
+              force: forceReset === true,
+            }),
+          });
+          const body = await response.json();
+          if (!response.ok) {
+            appendMessageBubble("error", body.error || "Не удалось сбросить агента");
+            setStatus("ошибка", "error");
+            return;
+          }
+          appendSystemNote(
+            "Агент сброшен · " +
+              (body.workspaceId || selectedWorkspaceId) +
+              " · следующий запрос создаст нового",
+          );
+          setStatus("готов", "");
+        } finally {
+          setComposerEnabled(true);
+        }
+      }
+
+      resetAgentButton.addEventListener("click", () => {
+        void resetWorkspaceAgent(true);
+      });
 
       resetMemoryButton.addEventListener("click", () => {
         void resetWorkspaceMemory();
