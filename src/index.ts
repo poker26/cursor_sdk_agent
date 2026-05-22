@@ -39,6 +39,11 @@ import {
   loadWorkspaceRegistryFromEnv,
   type WorkspaceEntry,
 } from "./workspace-registry.js";
+import {
+  getVpnHealthPollIntervalMs,
+  getVpnHealthUrl,
+  probeVpnHealth,
+} from "./vpn-health.js";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
@@ -684,6 +689,10 @@ application.get("/api/config", (_request, response) => {
     mcpServerIds: configuredMcpServers.map((entry) => entry.id),
     uploadMaxBytes: UPLOAD_MAX_BYTES,
     modelId: process.env.CURSOR_MODEL_ID?.trim() || "composer-2",
+    vpnHealth: {
+      healthUrl: getVpnHealthUrl(),
+      pollIntervalMs: getVpnHealthPollIntervalMs(),
+    },
     brain: {
       memoryEnabled: true,
       supabase: isSupabaseBrainEnabled(),
@@ -692,6 +701,11 @@ application.get("/api/config", (_request, response) => {
       embeddingProvider: getEmbeddingProviderLabel(),
     },
   });
+});
+
+application.get("/api/vpn-health", async (_request, response) => {
+  const probeResult = await probeVpnHealth();
+  response.json(probeResult);
 });
 
 application.post("/api/chat", async (request, response) => {

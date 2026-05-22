@@ -56,6 +56,57 @@
         color: var(--error);
         border-color: #6e3030;
       }
+      #vpn-indicator {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.3rem 0.6rem;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        flex-shrink: 0;
+        user-select: none;
+      }
+      #vpn-indicator .vpn-dot {
+        width: 13px;
+        height: 13px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      #vpn-indicator.unknown .vpn-dot {
+        background: #8b949e;
+        box-shadow: 0 0 6px #8b949e88;
+      }
+      #vpn-indicator.ok {
+        border-color: #238636;
+        background: rgba(35, 134, 54, 0.18);
+        color: #7ee787;
+      }
+      #vpn-indicator.ok .vpn-dot {
+        background: #3fb950;
+        box-shadow: 0 0 10px #3fb950cc;
+      }
+      #vpn-indicator.down {
+        border-color: #8b2e2e;
+        background: rgba(248, 81, 73, 0.14);
+        color: #ffb4af;
+      }
+      #vpn-indicator.down .vpn-dot {
+        background: #f85149;
+        box-shadow: 0 0 10px #f85149cc;
+        animation: vpn-blink 1.2s ease-in-out infinite;
+      }
+      @keyframes vpn-blink {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.45;
+        }
+      }
       .toolbar {
         display: flex;
         flex-wrap: wrap;
@@ -199,6 +250,16 @@
   </head>
   <body>
     <header>
+      <div
+        id="vpn-indicator"
+        class="vpn-indicator unknown"
+        role="status"
+        aria-live="polite"
+        title="VPN: проверка…"
+      >
+        <span class="vpn-dot" aria-hidden="true"></span>
+        <span class="vpn-label">VPN</span>
+      </div>
       <h1>Cursor Agent</h1>
       <select id="workspace-select" title="Рабочая папка агента (репозиторий)"></select>
       <span id="status-pill">готов</span>
@@ -237,6 +298,7 @@
       const attachListElement = document.getElementById("attach-list");
       const workspaceSelectElement = document.getElementById("workspace-select");
       const statusPillElement = document.getElementById("status-pill");
+      const vpnIndicatorElement = document.getElementById("vpn-indicator");
 
       let chatSessionId = localStorage.getItem(SESSION_STORAGE_KEY) || "";
       let selectedWorkspaceId = localStorage.getItem(WORKSPACE_STORAGE_KEY) || "";
@@ -244,6 +306,8 @@
       let isRequestInFlight = false;
       let currentAgentBubbleElement = null;
       let pendingAttachments = [];
+      let vpnHealthPollIntervalMs = 20000;
+      let vpnHealthPollTimer = null;
 
       function persistSessionId(sessionId) {
         chatSessionId = sessionId;
@@ -258,6 +322,54 @@
       function setStatus(label, mode) {
         statusPillElement.textContent = label;
         statusPillElement.className = mode || "";
+      }
+
+      function updateVpnIndicator(probePayload) {
+        const isVpnOk = Boolean(probePayload && probePayload.ok);
+        vpnIndicatorElement.className = isVpnOk ? "vpn-indicator ok" : "vpn-indicator down";
+        const checkedAtLabel =
+          probePayload && probePayload.checkedAt
+            ? new Date(probePayload.checkedAt).toLocaleTimeString()
+            : "";
+        if (isVpnOk) {
+          vpnIndicatorElement.title =
+            "VPN: доступен (Atlassian MCP health OK)" +
+            (checkedAtLabel ? " · " + checkedAtLabel : "");
+        } else {
+          const errorHint =
+            probePayload && probePayload.error ? probePayload.error : "нет ответа";
+          vpnIndicatorElement.title =
+            "VPN: недоступен — " + errorHint + (checkedAtLabel ? " · " + checkedAtLabel : "");
+        }
+      }
+
+      function setVpnIndicatorChecking() {
+        vpnIndicatorElement.className = "vpn-indicator unknown";
+        vpnIndicatorElement.title = "VPN: проверка…";
+      }
+
+      async function pollVpnHealthOnce() {
+        try {
+          const healthResponse = await fetch("/api/vpn-health");
+          const probePayload = await healthResponse.json();
+          updateVpnIndicator(probePayload);
+        } catch (fetchError) {
+          updateVpnIndicator({
+            ok: false,
+            error: fetchError instanceof Error ? fetchError.message : "ошибка запроса",
+          });
+        }
+      }
+
+      function startVpnHealthPolling() {
+        if (vpnHealthPollTimer) {
+          clearInterval(vpnHealthPollTimer);
+        }
+        setVpnIndicatorChecking();
+        void pollVpnHealthOnce();
+        vpnHealthPollTimer = setInterval(() => {
+          void pollVpnHealthOnce();
+        }, vpnHealthPollIntervalMs);
       }
 
       function scrollMessagesToBottom() {
@@ -389,6 +501,9 @@
         }
         if (selectedWorkspaceId) {
           workspaceSelectElement.value = selectedWorkspaceId;
+        }
+        if (config.vpnHealth && config.vpnHealth.pollIntervalMs) {
+          vpnHealthPollIntervalMs = config.vpnHealth.pollIntervalMs;
         }
       }
 
@@ -650,6 +765,7 @@
 
       async function bootstrap() {
         await loadServerConfig();
+        startVpnHealthPolling();
         const historyMessages = loadHistoryFromStorage();
         if (!chatSessionId) {
           await startNewChat();
