@@ -23,7 +23,7 @@ function stripVoiceUnfriendlyProse(text: string): string {
   let prose = text;
 
   prose = prose.replace(
-    /^.*\b(?:уточняю|перечитываю|сейчас открою|через подключённый exchange|подключённый exchange)\b.*$/gim,
+    /^.*\b(?:уточняю|уточняюсь|перечитываю|проверяю|сейчас|сначала|далее|затем|открою|посмотрю|запрашиваю|обращаюсь|через подключённый exchange|подключённый exchange|через exchange|ews|mcp)\b.*$/gim,
     " ",
   );
 
