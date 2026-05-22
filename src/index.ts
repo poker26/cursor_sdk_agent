@@ -91,6 +91,10 @@ const defaultWorkspaceId = workspaceRegistry[0].id;
 
 const application = express();
 application.disable("x-powered-by");
+application.use((_request, response, next) => {
+  response.setHeader("Permissions-Policy", "microphone=(self)");
+  next();
+});
 application.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 const basicAuthUser = process.env.CHAT_BASIC_USER?.trim();

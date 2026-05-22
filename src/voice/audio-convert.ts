@@ -22,6 +22,16 @@ export async function prepareAudioBufferForYandexStt(
     const convertedBuffer = await convertAudioWithFfmpeg(audioBuffer, "mp3", "ogg");
     return { audioBuffer: convertedBuffer, format: "oggopus" };
   }
+  if (
+    normalizedMimeType.includes("mp4") ||
+    normalizedMimeType.includes("m4a") ||
+    normalizedMimeType.includes("aac") ||
+    normalizedMimeType.includes("caf") ||
+    normalizedMimeType.includes("x-m4a")
+  ) {
+    const convertedBuffer = await convertAudioWithFfmpeg(audioBuffer, "m4a", "ogg");
+    return { audioBuffer: convertedBuffer, format: "oggopus" };
+  }
   throw new Error(
     `Неподдерживаемый формат аудио (${mimeType || "unknown"}). Запишите через Chrome или установите ffmpeg на сервере.`,
   );
@@ -102,6 +112,9 @@ export function guessMimeTypeFromFilename(filename: string): string {
   }
   if (lowerName.endsWith(".mp3")) {
     return "audio/mpeg";
+  }
+  if (lowerName.endsWith(".m4a") || lowerName.endsWith(".mp4")) {
+    return "audio/mp4";
   }
   return "application/octet-stream";
 }

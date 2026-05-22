@@ -385,6 +385,7 @@
       let voiceEnabled = false;
       let voiceAutoSend = true;
       let voiceMediaRecorder = null;
+      let voiceRecordingStream = null;
       let voiceRecordedChunks = [];
       let isVoiceRecording = false;
       let currentSpeechAudio = null;
@@ -663,18 +664,123 @@
         }
       }
 
+      function isYandexBrowser() {
+        return /YaBrowser/i.test(navigator.userAgent || "");
+      }
+
+      function describeMicrophoneError(microphoneError) {
+        const errorName =
+          microphoneError && typeof microphoneError === "object" && microphoneError.name
+            ? microphoneError.name
+            : "";
+        const errorMessage =
+          microphoneError instanceof Error
+            ? microphoneError.message
+            : String(microphoneError || "");
+        if (
+          errorName === "NotAllowedError" ||
+          errorName === "PermissionDeniedError" ||
+          /permission/i.test(errorMessage)
+        ) {
+          let userHint =
+            "Микрофон запрещён для этого сайта. ";
+          if (/android/i.test(navigator.userAgent || "")) {
+            userHint +=
+              "Android: ⋮ → «Информация о сайте» → Разрешения → Микрофон → «Разрешить». ";
+            if (isYandexBrowser()) {
+              userHint +=
+                "Яндекс Браузер: Настройки → Сайты → ваш домен чата → Микрофон — разрешить. ";
+            }
+            userHint +=
+              "Закройте вкладки с записью. Откройте чат по HTTPS и обновите страницу.";
+          } else {
+            userHint += "Разрешите микрофон для сайта в настройках браузера и обновите страницу.";
+          }
+          return userHint;
+        }
+        if (errorName === "NotFoundError") {
+          return "Микрофон не найден на устройстве.";
+        }
+        if (errorName === "SecurityError" || window.isSecureContext !== true) {
+          return "Микрофон доступен только по HTTPS (защищённое соединение).";
+        }
+        return errorMessage || "Не удалось открыть микрофон.";
+      }
+
+      function requestMicrophoneStream() {
+        if (window.isSecureContext !== true) {
+          return Promise.reject(
+            Object.assign(new Error("Нужен HTTPS."), { name: "SecurityError" }),
+          );
+        }
+        const audioConstraints = { audio: true };
+        if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function") {
+          return navigator.mediaDevices.getUserMedia(audioConstraints);
+        }
+        const legacyGetUserMedia =
+          navigator.getUserMedia ||
+          navigator.webkitGetUserMedia ||
+          navigator.mozGetUserMedia;
+        if (legacyGetUserMedia) {
+          return new Promise((resolve, reject) => {
+            legacyGetUserMedia.call(navigator, audioConstraints, resolve, reject);
+          });
+        }
+        return Promise.reject(
+          Object.assign(new Error("getUserMedia не поддерживается."), {
+            name: "NotSupportedError",
+          }),
+        );
+      }
+
       function pickVoiceRecordingMimeType() {
+        if (typeof MediaRecorder === "undefined") {
+          return null;
+        }
         const mimeCandidates = [
-          "audio/ogg;codecs=opus",
           "audio/webm;codecs=opus",
           "audio/webm",
+          "audio/ogg;codecs=opus",
+          "audio/mp4",
+          "audio/aac",
         ];
         for (const mimeCandidate of mimeCandidates) {
-          if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mimeCandidate)) {
+          if (MediaRecorder.isTypeSupported(mimeCandidate)) {
             return mimeCandidate;
           }
         }
-        return "";
+        return null;
+      }
+
+      function createVoiceMediaRecorder(mediaStream, preferredMimeType) {
+        if (preferredMimeType) {
+          try {
+            return new MediaRecorder(mediaStream, { mimeType: preferredMimeType });
+          } catch {
+            /* браузерный формат по умолчанию */
+          }
+        }
+        return new MediaRecorder(mediaStream);
+      }
+
+      function voiceRecordingFilename(recordingMimeType) {
+        const normalizedMime = (recordingMimeType || "").toLowerCase();
+        if (normalizedMime.includes("ogg")) {
+          return "voice.ogg";
+        }
+        if (normalizedMime.includes("mp4") || normalizedMime.includes("m4a") || normalizedMime.includes("aac")) {
+          return "voice.m4a";
+        }
+        return "voice.webm";
+      }
+
+      function releaseVoiceRecordingStream() {
+        if (voiceRecordingStream) {
+          for (const mediaTrack of voiceRecordingStream.getTracks()) {
+            mediaTrack.stop();
+          }
+          voiceRecordingStream = null;
+        }
       }
 
       function blobToBase64(audioBlob) {
@@ -713,7 +819,7 @@
           body: JSON.stringify({
             audioBase64,
             mimeType: recordingMimeType,
-            filename: recordingMimeType.includes("ogg") ? "voice.ogg" : "voice.webm",
+            filename: voiceRecordingFilename(recordingMimeType),
           }),
         });
         const transcribeBody = await transcribeResponse.json();
@@ -741,35 +847,24 @@
         setStatus("готов", "");
       }
 
-      async function startVoiceRecording() {
-        if (!voiceEnabled || isRequestInFlight || isVoiceRecording) {
-          return;
+      function beginVoiceRecordingWithStream(mediaStream) {
+        if (typeof MediaRecorder === "undefined") {
+          throw new Error("Запись голоса не поддерживается в этом браузере.");
         }
-        stopSpeechPlayback();
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          appendMessageBubble("error", "Микрофон недоступен (нужен HTTPS).");
-          return;
-        }
-        const recordingMimeType = pickVoiceRecordingMimeType();
-        if (!recordingMimeType) {
-          appendMessageBubble("error", "Браузер не поддерживает запись аудио.");
-          return;
-        }
-        const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const preferredMimeType = pickVoiceRecordingMimeType();
         voiceRecordedChunks = [];
-        voiceMediaRecorder = new MediaRecorder(mediaStream, { mimeType: recordingMimeType });
+        voiceRecordingStream = mediaStream;
+        voiceMediaRecorder = createVoiceMediaRecorder(mediaStream, preferredMimeType);
         voiceMediaRecorder.ondataavailable = (recorderEvent) => {
           if (recorderEvent.data && recorderEvent.data.size > 0) {
             voiceRecordedChunks.push(recorderEvent.data);
           }
         };
         voiceMediaRecorder.onstop = () => {
-          for (const mediaTrack of mediaStream.getTracks()) {
-            mediaTrack.stop();
-          }
+          releaseVoiceRecordingStream();
           void transcribeAndSendVoiceRecording();
         };
-        voiceMediaRecorder.start();
+        voiceMediaRecorder.start(300);
         isVoiceRecording = true;
         voiceRecordButton.classList.add("recording");
         voiceRecordButton.title = "Идёт запись… Нажмите для остановки и отправки";
@@ -794,14 +889,34 @@
           stopVoiceRecording();
           return;
         }
+        if (!voiceEnabled || isRequestInFlight) {
+          return;
+        }
+
+        let mediaStream;
         try {
-          await startVoiceRecording();
+          mediaStream = await requestMicrophoneStream();
         } catch (microphoneError) {
+          appendMessageBubble("error", describeMicrophoneError(microphoneError));
+          setStatus("ошибка", "error");
+          return;
+        }
+
+        try {
+          stopSpeechPlayback();
+          beginVoiceRecordingWithStream(mediaStream);
+        } catch (recordingError) {
+          releaseVoiceRecordingStream();
+          if (mediaStream) {
+            for (const mediaTrack of mediaStream.getTracks()) {
+              mediaTrack.stop();
+            }
+          }
           appendMessageBubble(
             "error",
-            microphoneError instanceof Error
-              ? microphoneError.message
-              : "Не удалось открыть микрофон",
+            recordingError instanceof Error
+              ? recordingError.message
+              : "Не удалось начать запись",
           );
           setStatus("ошибка", "error");
         }
