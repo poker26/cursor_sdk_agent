@@ -24,13 +24,15 @@ export async function transcribeAudioWithYandex(
 
   const recognizeUrl = `https://stt.api.cloud.yandex.net/speech/v1/stt:recognize?${queryParameters.toString()}`;
 
+  const requestBodyBytes = new Uint8Array(preparedBuffer);
+
   const httpResponse = await fetch(recognizeUrl, {
     method: "POST",
     headers: {
       Authorization: `Api-Key ${voiceConfig.apiKey}`,
       "Content-Type": "application/octet-stream",
     },
-    body: preparedBuffer,
+    body: requestBodyBytes,
   });
 
   const responseBodyText = await httpResponse.text();
