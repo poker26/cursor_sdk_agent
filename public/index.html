@@ -284,7 +284,8 @@
         flex-shrink: 0;
         font: inherit;
         font-size: 0.85rem;
-        padding: 0.15rem 0.4rem;
+        min-width: 2rem;
+        padding: 0.15rem 0.45rem;
         border-radius: 6px;
         border: 1px solid var(--border);
         background: #21262d;
@@ -297,6 +298,16 @@
       }
       .speak-btn:disabled {
         opacity: 0.45;
+      }
+      .speak-btn.speak-loading {
+        opacity: 0.75;
+        cursor: wait;
+      }
+      .speak-btn.speak-playing {
+        border-color: #58a6ff;
+        background: #1a3a5c;
+        color: #79c0ff;
+        box-shadow: 0 0 0 1px #388bfd66;
       }
     </style>
   </head>
@@ -375,6 +386,9 @@
       let voiceRecordedChunks = [];
       let isVoiceRecording = false;
       let currentSpeechAudio = null;
+      let currentSpeechObjectUrl = null;
+      let activeSpeakButtonElement = null;
+      let speechFetchAbortController = null;
 
       function persistSessionId(sessionId) {
         chatSessionId = sessionId;
@@ -506,58 +520,144 @@
         return agentBubbleElement.querySelector(".msg-text") || agentBubbleElement;
       }
 
-      function stopCurrentSpeechPlayback() {
-        if (currentSpeechAudio) {
-          currentSpeechAudio.pause();
-          currentSpeechAudio = null;
+      function resetAllSpeakButtonVisuals() {
+        const speakButtons = messagesElement.querySelectorAll(".speak-btn");
+        for (const speakButton of speakButtons) {
+          speakButton.classList.remove("speak-loading", "speak-playing");
+          speakButton.textContent = "🔊";
+          speakButton.title = "Озвучить ответ (повторное нажатие — стоп)";
+          speakButton.disabled = false;
         }
       }
 
-      async function playSpeechForText(textToSpeak) {
-        const trimmedText = (textToSpeak || "").trim();
-        if (!trimmedText || !voiceEnabled) {
+      function setSpeakButtonVisual(speakButtonElement, visualState) {
+        speakButtonElement.classList.remove("speak-loading", "speak-playing");
+        if (visualState === "loading") {
+          speakButtonElement.classList.add("speak-loading");
+          speakButtonElement.textContent = "…";
+          speakButtonElement.title = "Готовим озвучку…";
           return;
         }
-        stopCurrentSpeechPlayback();
+        if (visualState === "playing") {
+          speakButtonElement.classList.add("speak-playing");
+          speakButtonElement.textContent = "⏹";
+          speakButtonElement.title = "Остановить озвучку";
+          return;
+        }
+        speakButtonElement.textContent = "🔊";
+        speakButtonElement.title = "Озвучить ответ (повторное нажатие — стоп)";
+      }
+
+      function stopSpeechPlayback() {
+        if (speechFetchAbortController) {
+          speechFetchAbortController.abort();
+          speechFetchAbortController = null;
+        }
+        if (currentSpeechAudio) {
+          currentSpeechAudio.pause();
+          currentSpeechAudio.removeAttribute("src");
+          currentSpeechAudio.load();
+          currentSpeechAudio = null;
+        }
+        if (currentSpeechObjectUrl) {
+          URL.revokeObjectURL(currentSpeechObjectUrl);
+          currentSpeechObjectUrl = null;
+        }
+        activeSpeakButtonElement = null;
+        resetAllSpeakButtonVisuals();
+        if (!isRequestInFlight && !isVoiceRecording) {
+          setStatus("готов", "");
+        }
+      }
+
+      function bindSpeakButton(speakButtonElement, textElement) {
+        speakButtonElement.addEventListener("click", () => {
+          speakButtonElement.blur();
+          void handleSpeakButtonClick(speakButtonElement, textElement);
+        });
+      }
+
+      async function handleSpeakButtonClick(speakButtonElement, textElement) {
+        if (!voiceEnabled) {
+          return;
+        }
+        const messageText = (textElement.textContent || "").trim();
+        if (!messageText) {
+          return;
+        }
+
+        if (
+          activeSpeakButtonElement === speakButtonElement &&
+          (currentSpeechAudio || speechFetchAbortController)
+        ) {
+          stopSpeechPlayback();
+          return;
+        }
+
+        stopSpeechPlayback();
+        activeSpeakButtonElement = speakButtonElement;
+        setSpeakButtonVisual(speakButtonElement, "loading");
         setStatus("озвучивание…", "busy");
+
+        speechFetchAbortController = new AbortController();
+        const fetchSignal = speechFetchAbortController.signal;
+
         try {
           const synthesizeResponse = await fetch("/api/voice/synthesize", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: trimmedText }),
+            body: JSON.stringify({ text: messageText }),
+            signal: fetchSignal,
           });
+
+          if (activeSpeakButtonElement !== speakButtonElement) {
+            return;
+          }
+
           if (!synthesizeResponse.ok) {
             const errorPayload = await synthesizeResponse.json().catch(() => ({}));
             appendMessageBubble(
               "error",
               errorPayload.error || "Не удалось синтезировать речь",
             );
+            stopSpeechPlayback();
             setStatus("ошибка", "error");
             return;
           }
+
           const audioBlob = await synthesizeResponse.blob();
-          const objectUrl = URL.createObjectURL(audioBlob);
-          const audioElement = new Audio(objectUrl);
+          if (activeSpeakButtonElement !== speakButtonElement) {
+            return;
+          }
+
+          currentSpeechObjectUrl = URL.createObjectURL(audioBlob);
+          const audioElement = new Audio(currentSpeechObjectUrl);
           currentSpeechAudio = audioElement;
+          speechFetchAbortController = null;
+
+          setSpeakButtonVisual(speakButtonElement, "playing");
+
           audioElement.onended = () => {
-            URL.revokeObjectURL(objectUrl);
             if (currentSpeechAudio === audioElement) {
-              currentSpeechAudio = null;
-            }
-            if (!isRequestInFlight) {
-              setStatus("готов", "");
+              stopSpeechPlayback();
             }
           };
+
           await audioElement.play();
-          if (!isRequestInFlight) {
-            setStatus("готов", "");
-          }
         } catch (playbackError) {
-          appendMessageBubble(
-            "error",
-            playbackError instanceof Error ? playbackError.message : "Ошибка воспроизведения",
-          );
-          setStatus("ошибка", "error");
+          if (playbackError && playbackError.name === "AbortError") {
+            return;
+          }
+          if (activeSpeakButtonElement === speakButtonElement) {
+            appendMessageBubble(
+              "error",
+              playbackError instanceof Error
+                ? playbackError.message
+                : "Ошибка воспроизведения",
+            );
+            stopSpeechPlayback();
+            setStatus("ошибка", "error");
+          }
         }
       }
 
@@ -640,7 +740,7 @@
         if (!voiceEnabled || isRequestInFlight || isVoiceRecording) {
           return;
         }
-        stopCurrentSpeechPlayback();
+        stopSpeechPlayback();
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           appendMessageBubble("error", "Микрофон недоступен (нужен HTTPS).");
           return;
@@ -713,11 +813,9 @@
           const speakButtonElement = document.createElement("button");
           speakButtonElement.type = "button";
           speakButtonElement.className = "speak-btn";
-          speakButtonElement.title = "Озвучить ответ";
+          speakButtonElement.title = "Озвучить ответ (повторное нажатие — стоп)";
           speakButtonElement.textContent = "🔊";
-          speakButtonElement.addEventListener("click", () => {
-            void playSpeechForText(textElement.textContent || "");
-          });
+          bindSpeakButton(speakButtonElement, textElement);
           bubbleElement.appendChild(speakButtonElement);
         }
         messagesElement.appendChild(bubbleElement);
@@ -746,11 +844,9 @@
             const speakButtonElement = document.createElement("button");
             speakButtonElement.type = "button";
             speakButtonElement.className = "speak-btn";
-            speakButtonElement.title = "Озвучить ответ";
+            speakButtonElement.title = "Озвучить ответ (повторное нажатие — стоп)";
             speakButtonElement.textContent = "🔊";
-            speakButtonElement.addEventListener("click", () => {
-              void playSpeechForText(textElement.textContent || "");
-            });
+            bindSpeakButton(speakButtonElement, textElement);
             currentAgentBubbleElement.appendChild(speakButtonElement);
           }
           messagesElement.appendChild(currentAgentBubbleElement);
@@ -911,7 +1007,7 @@
           return;
         }
 
-        stopCurrentSpeechPlayback();
+        stopSpeechPlayback();
         isRequestInFlight = true;
         currentAgentBubbleElement = null;
         setComposerEnabled(false);

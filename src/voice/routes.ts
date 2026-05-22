@@ -7,6 +7,7 @@ import {
 import { guessMimeTypeFromFilename } from "./audio-convert.js";
 import { transcribeAudioWithYandex } from "./yandex-stt.js";
 import { synthesizeSpeechWithYandex } from "./yandex-tts.js";
+import { prepareTextForSpeechSynthesis } from "./text-for-tts.js";
 
 interface VoiceTranscribeRequestBody {
   audioBase64?: string;
@@ -97,10 +98,18 @@ export function registerVoiceRoutes(application: express.Application): void {
     }
 
     const requestBody = request.body as VoiceSynthesizeRequestBody;
-    const textToSpeak =
+    const rawTextToSpeak =
       typeof requestBody.text === "string" ? requestBody.text.trim() : "";
-    if (!textToSpeak) {
+    if (!rawTextToSpeak) {
       response.status(400).json({ error: "Нужно поле text." });
+      return;
+    }
+
+    const textToSpeak = prepareTextForSpeechSynthesis(rawTextToSpeak);
+    if (!textToSpeak) {
+      response.status(400).json({
+        error: "После очистки markdown не осталось текста для озвучивания.",
+      });
       return;
     }
 
