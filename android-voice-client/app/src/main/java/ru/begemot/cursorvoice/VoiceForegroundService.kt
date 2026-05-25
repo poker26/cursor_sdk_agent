@@ -25,6 +25,9 @@ class VoiceForegroundService : Service(), VoiceStateListener {
         super.onCreate()
         appPreferences = AppPreferences(applicationContext)
         voiceTurnOrchestrator = VoiceTurnOrchestrator(applicationContext, appPreferences, this)
+        voiceTurnOrchestrator.onTurnFullyFinished = {
+            mainHandler.post { scheduleRestartWakeListening() }
+        }
         createNotificationChannel()
     }
 
@@ -93,21 +96,33 @@ class VoiceForegroundService : Service(), VoiceStateListener {
         mainHandler.postDelayed({
             voiceTurnOrchestrator.finishPushToTalkAndRunTurn()
             isRecordingCommand = false
-            restartWakeListening()
         }, COMMAND_RECORDING_MS)
     }
 
+    private fun scheduleRestartWakeListening() {
+        mainHandler.postDelayed({ restartWakeListening() }, WAKE_RESTART_DELAY_MS)
+    }
+
     private fun restartWakeListening() {
-        if (voiceTurnOrchestrator.isBusy()) {
-            mainHandler.postDelayed({ restartWakeListening() }, 2000)
+        if (voiceTurnOrchestrator.isBusy() || isRecordingCommand) {
+            mainHandler.postDelayed({ restartWakeListening() }, 1500)
             return
         }
+
+        wakeWordEngine?.stopListening()
+
         val wakePhrase = appPreferences.wakePhrase
         wakeWordEngine = WakeWordEngine(applicationContext, wakePhrase) {
             mainHandler.post { handleWakePhraseDetected() }
         }
         if (wakeWordEngine?.startListening() == true) {
+            lastWakeTriggeredAtMs = 0L
             onStateChanged(VoiceClientState.WAKE_LISTENING, "Жду: $wakePhrase")
+            onLogLine("Снова слушаю wake-фразу")
+        } else {
+            onStateChanged(VoiceClientState.IDLE, "Wake не запустился")
+            onLogLine("Не удалось перезапустить wake — проверьте модель Vosk")
+            mainHandler.postDelayed({ restartWakeListening() }, 5000)
         }
     }
 
@@ -158,5 +173,6 @@ class VoiceForegroundService : Service(), VoiceStateListener {
         private const val NOTIFICATION_ID = 41001
         private const val COMMAND_RECORDING_MS = 6000L
         private const val WAKE_COOLDOWN_MS = 4000L
+        private const val WAKE_RESTART_DELAY_MS = 800L
     }
 }

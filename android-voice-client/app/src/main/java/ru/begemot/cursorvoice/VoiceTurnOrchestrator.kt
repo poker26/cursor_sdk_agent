@@ -29,7 +29,9 @@ class VoiceTurnOrchestrator(
     @Volatile
     private var isTurnInProgress = false
 
-    fun isBusy(): Boolean = isTurnInProgress
+    var onTurnFullyFinished: (() -> Unit)? = null
+
+    fun isBusy(): Boolean = isTurnInProgress || mediaPlayer != null
 
     fun startPushToTalkRecording() {
         if (isTurnInProgress) {
@@ -70,6 +72,7 @@ class VoiceTurnOrchestrator(
         if (recordedUtterance == null) {
             stateListener.onStateChanged(VoiceClientState.IDLE, "Готов")
             stateListener.onLogLine("Запись пуста")
+            notifyTurnFullyFinished()
             return
         }
         runVoiceTurn(recordedUtterance)
@@ -126,9 +129,14 @@ class VoiceTurnOrchestrator(
                 isTurnInProgress = false
                 if (mediaPlayer == null) {
                     stateListener.onStateChanged(VoiceClientState.IDLE, "Готов")
+                    notifyTurnFullyFinished()
                 }
             }
         }.start()
+    }
+
+    private fun notifyTurnFullyFinished() {
+        onTurnFullyFinished?.invoke()
     }
 
     private fun speakErrorMessage(errorMessage: String) {
@@ -154,11 +162,13 @@ class VoiceTurnOrchestrator(
             player.release()
             mediaPlayer = null
             stateListener.onStateChanged(VoiceClientState.IDLE, "Готов")
+            notifyTurnFullyFinished()
         }
         player.setOnErrorListener { _, _, _ ->
             temporaryAudioFile.delete()
             mediaPlayer = null
             stateListener.onStateChanged(VoiceClientState.IDLE, "Готов")
+            notifyTurnFullyFinished()
             true
         }
         player.start()

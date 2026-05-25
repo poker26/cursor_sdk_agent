@@ -3,6 +3,7 @@ package ru.begemot.cursorvoice
 import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioRecord.RECORDSTATE_RECORDING
 import android.media.MediaRecorder
 import org.json.JSONObject
 import org.vosk.Model
@@ -63,10 +64,12 @@ class WakeWordEngine(
                 val audioBuffer = ByteArray(bufferSize)
                 while (isListening) {
                     val bytesRead = record.read(audioBuffer, 0, audioBuffer.size)
-                    if (bytesRead > 0 && recognizer.acceptWaveForm(audioBuffer, bytesRead)) {
-                        checkPartialForWakePhrase(recognizer.partialResult, normalizedWakePhrase)
-                    } else {
-                        checkPartialForWakePhrase(recognizer.partialResult, normalizedWakePhrase)
+                    if (bytesRead > 0) {
+                        if (recognizer.acceptWaveForm(audioBuffer, bytesRead)) {
+                            checkTextForWakePhrase(recognizer.result, normalizedWakePhrase)
+                        } else {
+                            checkTextForWakePhrase(recognizer.partialResult, normalizedWakePhrase)
+                        }
                     }
                 }
 
@@ -84,19 +87,35 @@ class WakeWordEngine(
 
     fun stopListening() {
         isListening = false
-        audioRecord?.stop()
-        audioRecord?.release()
+        val recordToStop = audioRecord
         audioRecord = null
-        recognitionThread?.join(1500)
+        if (recordToStop != null) {
+            try {
+                if (recordToStop.recordingState == RECORDSTATE_RECORDING) {
+                    recordToStop.stop()
+                }
+            } catch (_: Exception) {
+                /* already stopped */
+            }
+            try {
+                recordToStop.release()
+            } catch (_: Exception) {
+                /* already released */
+            }
+        }
+        recognitionThread?.join(2000)
         recognitionThread = null
     }
 
     fun isModelAvailable(): Boolean = resolveVoskModelDirectory() != null
 
-    private fun checkPartialForWakePhrase(partialJson: String, normalizedWakePhrase: String) {
+    private fun checkTextForWakePhrase(recognitionJson: String, normalizedWakePhrase: String) {
         try {
-            val partialText = JSONObject(partialJson).optString("partial", "").lowercase()
-            if (partialText.contains(normalizedWakePhrase)) {
+            val jsonObject = JSONObject(recognitionJson)
+            val partialText = jsonObject.optString("partial", "").lowercase()
+            val finalText = jsonObject.optString("text", "").lowercase()
+            val combinedText = "$partialText $finalText".trim()
+            if (combinedText.contains(normalizedWakePhrase)) {
                 onWakePhraseDetected()
             }
         } catch (_: Exception) {
