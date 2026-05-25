@@ -53,6 +53,7 @@ import {
   type ChatResponseMode,
 } from "./chat-response-style.js";
 import { sanitizeAssistantResponseForChat } from "./assistant-response-sanitize.js";
+import { buildCurrentDateTimeContextPrefix } from "./current-datetime-context.js";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
@@ -683,13 +684,14 @@ async function executeChatMessageForWorkspace(
   }
 
   const workspaceRecord = await getOrCreateWorkspaceAgent(workspace);
+  const dateTimePrefix = buildCurrentDateTimeContextPrefix();
   const stylePrefix = buildChatResponseStylePrefix(options.responseMode);
   const brainPrefix = await buildBrainContextPrefix({
     workspaceId: workspace.id,
     workspacePath: workspace.path,
     userMessageText,
   });
-  const combinedContextPrefix = [stylePrefix, brainPrefix]
+  const combinedContextPrefix = [dateTimePrefix, stylePrefix, brainPrefix]
     .filter((section) => section.trim().length > 0)
     .join("");
   const styleSuffix = buildChatResponseStyleSuffix(options.responseMode);
