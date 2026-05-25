@@ -692,12 +692,15 @@ async function executeChatMessageForWorkspace(
   const combinedContextPrefix = [stylePrefix, brainPrefix]
     .filter((section) => section.trim().length > 0)
     .join("");
-  const styleSuffix = buildChatResponseStyleSuffix();
+  const styleSuffix = buildChatResponseStyleSuffix(options.responseMode);
   const payloadWithContext = prependTextToUserPayload(
     userMessagePayload,
     combinedContextPrefix,
   );
-  const payloadWithBrain = appendTextToUserPayload(payloadWithContext, styleSuffix);
+  const payloadWithBrain =
+    styleSuffix.trim().length > 0
+      ? appendTextToUserPayload(payloadWithContext, styleSuffix)
+      : payloadWithContext;
 
   const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
   const agentRun = await workspaceRecord.agent.send(payloadWithBrain, sendOptions);
@@ -712,8 +715,12 @@ async function executeChatMessageForWorkspace(
     },
   );
 
-  const sanitizedAssistantText = sanitizeAssistantResponseForChat(assistantAccumulatedText);
+  const isVoiceResponseMode = options.responseMode === "voice";
+  const sanitizedAssistantText = isVoiceResponseMode
+    ? sanitizeAssistantResponseForChat(assistantAccumulatedText)
+    : assistantAccumulatedText;
   if (
+    isVoiceResponseMode &&
     sanitizedAssistantText &&
     sanitizedAssistantText !== assistantAccumulatedText &&
     isClientStillConnected()
@@ -730,7 +737,7 @@ async function executeChatMessageForWorkspace(
         workspaceId: workspace.id,
         workspacePath: workspace.path,
         userMessageText,
-        assistantMessageText: sanitizedAssistantText || assistantAccumulatedText,
+        assistantMessageText: sanitizedAssistantText,
         runId: runOutcome.runId,
         runStatus: runOutcome.status,
       });

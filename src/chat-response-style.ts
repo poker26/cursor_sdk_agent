@@ -53,13 +53,17 @@ export function parseChatResponseMode(rawValue: unknown): ChatResponseMode {
   return "text";
 }
 
+/** Краткий стиль только для голосового запроса; текстовый чат — без ограничений. */
 export function buildChatResponseStylePrefix(responseMode: ChatResponseMode): string {
-  if (responseMode === "voice") {
-    return `${CHAT_UI_BASE_STYLE}\n\n${CHAT_UI_VOICE_EXTRA_STYLE}\n\n---\n\n`;
+  if (responseMode !== "voice") {
+    return "";
   }
-  return `${CHAT_UI_BASE_STYLE}\n\n---\n\n`;
+  return `${CHAT_UI_BASE_STYLE}\n\n${CHAT_UI_VOICE_EXTRA_STYLE}\n\n---\n\n`;
 }
 
-export function buildChatResponseStyleSuffix(): string {
+export function buildChatResponseStyleSuffix(responseMode: ChatResponseMode): string {
+  if (responseMode !== "voice") {
+    return "";
+  }
   return CHAT_RESPONSE_STYLE_SUFFIX;
 }
