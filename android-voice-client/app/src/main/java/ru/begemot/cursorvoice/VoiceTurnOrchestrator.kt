@@ -24,6 +24,7 @@ class VoiceTurnOrchestrator(
 ) {
     private val agentApiClient = AgentApiClient(appPreferences)
     private val utteranceRecorder = UtteranceRecorder(applicationContext)
+    private val localPromptSpeaker = LocalPromptSpeaker(applicationContext)
     private var mediaPlayer: MediaPlayer? = null
     @Volatile
     private var isTurnInProgress = false
@@ -35,8 +36,30 @@ class VoiceTurnOrchestrator(
             stateListener.onLogLine("Уже выполняется запрос")
             return
         }
+        localPromptSpeaker.speakPrompt("Слушаю")
         utteranceRecorder.startRecording()
         stateListener.onStateChanged(VoiceClientState.LISTENING, "Слушаю команду…")
+    }
+
+    fun repeatLastAssistantSpeech() {
+        val lastText = appPreferences.lastAssistantText.trim()
+        if (lastText.isEmpty()) {
+            stateListener.onLogLine("Нет предыдущего ответа для повтора")
+            return
+        }
+        if (isTurnInProgress) {
+            stateListener.onLogLine("Дождитесь окончания текущего запроса")
+            return
+        }
+        Thread {
+            try {
+                playAssistantSpeech(lastText)
+            } catch (repeatError: Exception) {
+                stateListener.onLogLine(
+                    "Повтор не удался: ${repeatError.message ?: repeatError.toString()}",
+                )
+            }
+        }.start()
     }
 
     fun finishPushToTalkAndRunTurn() {
@@ -71,6 +94,7 @@ class VoiceTurnOrchestrator(
             isTurnInProgress = true
             try {
                 stateListener.onStateChanged(VoiceClientState.THINKING, "Думаю…")
+                localPromptSpeaker.speakPrompt("Думаю")
                 val turnResult = agentApiClient.postVoiceTurn(
                     audioBase64 = recordedUtterance.audioBase64,
                     mimeType = recordedUtterance.mimeType,
@@ -80,10 +104,17 @@ class VoiceTurnOrchestrator(
                 if (!turnResult.ok || turnResult.assistantText.isBlank()) {
                     val errorText = turnResult.errorMessage ?: "Пустой ответ агента"
                     stateListener.onLogLine("Ошибка: $errorText (${turnResult.durationMs} мс)")
-                    speakErrorMessage(errorText)
+                    val speechErrorText =
+                        if (errorText.contains("занят", ignoreCase = true)) {
+                            "Подождите, агент занят"
+                        } else {
+                            errorText
+                        }
+                    speakErrorMessage(speechErrorText)
                     return
                 }
 
+                appPreferences.lastAssistantText = turnResult.assistantText
                 stateListener.onLogLine(
                     "Агент (${turnResult.durationMs} мс): ${turnResult.assistantText}",
                 )

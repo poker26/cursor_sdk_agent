@@ -5,6 +5,7 @@
     <string name="listen_button">Слушать</string>
     <string name="stop_button">Стоп</string>
     <string name="settings_button">Настройки</string>
+    <string name="repeat_button">Повторить ответ</string>
     <string name="start_service">Запустить фоновый режим</string>
     <string name="stop_service">Остановить фон</string>
     <string name="status_idle">Готов</string>

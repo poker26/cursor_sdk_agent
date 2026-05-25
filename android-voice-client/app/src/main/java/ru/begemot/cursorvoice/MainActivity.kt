@@ -58,6 +58,10 @@ class MainActivity : AppCompatActivity(), VoiceStateListener {
             handleListenButtonClick()
         }
 
+        activityBinding.repeatButton.setOnClickListener {
+            voiceTurnOrchestrator.repeatLastAssistantSpeech()
+        }
+
         activityBinding.toggleServiceButton.setOnClickListener {
             handleToggleServiceClick()
         }

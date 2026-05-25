@@ -43,6 +43,10 @@ class AppPreferences(context: Context) {
         get() = sharedPreferences.getBoolean(KEY_BACKGROUND_ENABLED, false)
         set(value) = sharedPreferences.edit().putBoolean(KEY_BACKGROUND_ENABLED, value).apply()
 
+    var lastAssistantText: String
+        get() = sharedPreferences.getString(KEY_LAST_ASSISTANT_TEXT, "") ?: ""
+        set(value) = sharedPreferences.edit().putString(KEY_LAST_ASSISTANT_TEXT, value).apply()
+
     companion object {
         private const val PREFERENCES_NAME = "cursor_voice_prefs"
         private const val KEY_GATEWAY_URL = "gateway_url"
@@ -52,6 +56,7 @@ class AppPreferences(context: Context) {
         private const val KEY_WAKE_PHRASE = "wake_phrase"
         private const val KEY_SESSION_ID = "session_id"
         private const val KEY_BACKGROUND_ENABLED = "background_enabled"
+        private const val KEY_LAST_ASSISTANT_TEXT = "last_assistant_text"
         const val DEFAULT_GATEWAY_URL = "https://cursor.begemot26.ru"
         const val DEFAULT_WAKE_PHRASE = "эй агент"
     }

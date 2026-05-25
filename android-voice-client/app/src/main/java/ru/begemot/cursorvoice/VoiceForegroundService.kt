@@ -88,6 +88,7 @@ class VoiceForegroundService : Service(), VoiceStateListener {
         isRecordingCommand = true
         wakeWordEngine?.stopListening()
         voiceTurnOrchestrator.startPushToTalkRecording()
+        onStateChanged(VoiceClientState.LISTENING, "Слушаю команду…")
 
         mainHandler.postDelayed({
             voiceTurnOrchestrator.finishPushToTalkAndRunTurn()

@@ -22,7 +22,7 @@
         android:layout_height="0dp"
         android:layout_marginTop="16dp"
         android:layout_marginBottom="16dp"
-        app:layout_constraintBottom_toTopOf="@+id/listenButton"
+        app:layout_constraintBottom_toTopOf="@+id/repeatButton"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/statusText">
@@ -36,9 +36,20 @@
     </ScrollView>
 
     <com.google.android.material.button.MaterialButton
+        android:id="@+id/repeatButton"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="@string/repeat_button"
+        app:layout_constraintBottom_toTopOf="@+id/listenButton"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+    <com.google.android.material.button.MaterialButton
         android:id="@+id/listenButton"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
         android:text="@string/listen_button"
         app:layout_constraintBottom_toTopOf="@+id/toggleServiceButton"
         app:layout_constraintEnd_toEndOf="parent"
