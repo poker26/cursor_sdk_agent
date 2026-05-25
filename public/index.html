@@ -172,6 +172,15 @@
         border: 1px solid var(--border);
         border-bottom-left-radius: 4px;
       }
+      .msg.agent .response-timing {
+        margin-top: 0.45rem;
+        font-size: 0.72rem;
+        color: var(--muted);
+        letter-spacing: 0.02em;
+      }
+      .msg.agent .response-timing.slow {
+        color: #f0c674;
+      }
       .msg.system {
         align-self: center;
         font-size: 0.78rem;
@@ -315,7 +324,7 @@
       }
     </style>
   </head>
-  <body>
+  <body data-ui-build="chat-response-timing-v2">
     <header>
       <div
         id="vpn-indicator"
@@ -396,6 +405,7 @@
       let currentSpeechObjectUrl = null;
       let activeSpeakButtonElement = null;
       let speechFetchAbortController = null;
+      let lastChatResponseElapsedMs = null;
 
       function persistSessionId(sessionId) {
         chatSessionId = sessionId;
@@ -432,6 +442,37 @@
           statusPillElement.title =
             "Ответ дольше 4,5 с — для навыка Алисы нужен укороченный или двухшаговый сценарий";
         }
+      }
+
+      function applyChatResponseTiming(responseElapsedMs, agentBubbleElement) {
+        if (typeof responseElapsedMs !== "number" || responseElapsedMs < 0) {
+          return;
+        }
+        lastChatResponseElapsedMs = responseElapsedMs;
+        const targetBubble =
+          agentBubbleElement ||
+          currentAgentBubbleElement ||
+          findLastAgentMessageBubble();
+        if (!targetBubble) {
+          return;
+        }
+        let timingElement = targetBubble.querySelector(".response-timing");
+        if (!timingElement) {
+          timingElement = document.createElement("div");
+          timingElement.className = "response-timing";
+          timingElement.setAttribute("aria-label", "Время ответа");
+          targetBubble.appendChild(timingElement);
+        }
+        const durationLabel = formatResponseDurationLabel(responseElapsedMs);
+        const aliceHint =
+          responseElapsedMs > ALICE_SKILL_RESPONSE_LIMIT_MS
+            ? " · >4,5 с (лимит Алисы)"
+            : "";
+        timingElement.textContent = "⏱ " + durationLabel + aliceHint;
+        timingElement.classList.toggle(
+          "slow",
+          responseElapsedMs > ALICE_SKILL_RESPONSE_LIMIT_MS,
+        );
       }
 
       function updateVpnIndicator(probePayload) {
@@ -595,7 +636,7 @@
         activeSpeakButtonElement = null;
         resetAllSpeakButtonVisuals();
         if (!isRequestInFlight && !isVoiceRecording) {
-          setStatus("готов", "");
+          setStatus("готов", "", lastChatResponseElapsedMs);
         }
       }
 
@@ -1238,6 +1279,74 @@
           return;
         }
 
+        function handleChatSseEvent(event) {
+          if (event.kind === "session" && event.sessionId) {
+            persistSessionId(event.sessionId);
+          }
+          if (event.kind === "session" && event.workspaceId) {
+            persistWorkspaceId(event.workspaceId);
+          } else if (event.kind === "assistant_text") {
+            const agentBubble = ensureAgentBubble();
+            const agentTextElement = getAgentBubbleTextElement(agentBubble);
+            if (agentTextElement) {
+              agentTextElement.textContent += event.text;
+            }
+            scrollMessagesToBottom();
+            saveHistoryToStorage();
+          } else if (event.kind === "assistant_text_final") {
+            const agentBubble =
+              currentAgentBubbleElement || findLastAgentMessageBubble();
+            const agentTextElement = getAgentBubbleTextElement(agentBubble);
+            if (agentTextElement && event.text) {
+              agentTextElement.textContent = event.text;
+            }
+            scrollMessagesToBottom();
+            saveHistoryToStorage();
+          } else if (event.kind === "tool_call") {
+            const label =
+              event.status === "running"
+                ? "▶ " + event.name
+                : event.status === "completed"
+                  ? "✓ " + event.name
+                  : "✗ " + event.name;
+            appendToolHint(label);
+          } else if (event.kind === "run_finished") {
+            lastRunSucceeded = event.status !== "error";
+            lastResponseElapsedMs = performance.now() - responseStartedAtMs;
+            const agentBubbleForTiming =
+              currentAgentBubbleElement || findLastAgentMessageBubble();
+            applyChatResponseTiming(lastResponseElapsedMs, agentBubbleForTiming);
+            if (event.status === "error") {
+              appendMessageBubble("error", "Агент завершил run со статусом error");
+              setStatus("ошибка", "error", lastResponseElapsedMs);
+            } else if (!replyWithSpeechAfterRun) {
+              setStatus("готов", "", lastResponseElapsedMs);
+            }
+            saveHistoryToStorage();
+          } else if (event.kind === "error") {
+            lastResponseElapsedMs = performance.now() - responseStartedAtMs;
+            appendMessageBubble("error", event.message);
+            setStatus("ошибка", "error", lastResponseElapsedMs);
+            saveHistoryToStorage();
+          }
+        }
+
+        function processSseLine(line) {
+          if (!line.startsWith("data:")) {
+            return;
+          }
+          const jsonPayloadText = line.slice(5).trim();
+          if (!jsonPayloadText) {
+            return;
+          }
+          try {
+            const event = JSON.parse(jsonPayloadText);
+            handleChatSseEvent(event);
+          } catch {
+            /* ignore malformed sse chunk */
+          }
+        }
+
         const responseBodyReader = fetchResponse.body.getReader();
         const textDecoder = new TextDecoder();
         let buffer = "";
@@ -1252,62 +1361,14 @@
           while (lineBreakIndex !== -1) {
             const line = buffer.slice(0, lineBreakIndex).trimEnd();
             buffer = buffer.slice(lineBreakIndex + 1);
-            if (line.startsWith("data:")) {
-              const jsonPayloadText = line.slice(5).trim();
-              try {
-                const event = JSON.parse(jsonPayloadText);
-                if (event.kind === "session" && event.sessionId) {
-                  persistSessionId(event.sessionId);
-                }
-                if (event.kind === "session" && event.workspaceId) {
-                  persistWorkspaceId(event.workspaceId);
-                } else if (event.kind === "assistant_text") {
-                  const agentBubble = ensureAgentBubble();
-                  const agentTextElement = getAgentBubbleTextElement(agentBubble);
-                  if (agentTextElement) {
-                    agentTextElement.textContent += event.text;
-                  }
-                  scrollMessagesToBottom();
-                  saveHistoryToStorage();
-                } else if (event.kind === "assistant_text_final") {
-                  const agentBubble =
-                    currentAgentBubbleElement || findLastAgentMessageBubble();
-                  const agentTextElement = getAgentBubbleTextElement(agentBubble);
-                  if (agentTextElement && event.text) {
-                    agentTextElement.textContent = event.text;
-                  }
-                  scrollMessagesToBottom();
-                  saveHistoryToStorage();
-                } else if (event.kind === "tool_call") {
-                  const label =
-                    event.status === "running"
-                      ? "▶ " + event.name
-                      : event.status === "completed"
-                        ? "✓ " + event.name
-                        : "✗ " + event.name;
-                  appendToolHint(label);
-                } else if (event.kind === "run_finished") {
-                  lastRunSucceeded = event.status !== "error";
-                  lastResponseElapsedMs = performance.now() - responseStartedAtMs;
-                  if (event.status === "error") {
-                    appendMessageBubble("error", "Агент завершил run со статусом error");
-                    setStatus("ошибка", "error", lastResponseElapsedMs);
-                  } else if (!replyWithSpeechAfterRun) {
-                    setStatus("готов", "", lastResponseElapsedMs);
-                  }
-                  saveHistoryToStorage();
-                } else if (event.kind === "error") {
-                  lastResponseElapsedMs = performance.now() - responseStartedAtMs;
-                  appendMessageBubble("error", event.message);
-                  setStatus("ошибка", "error", lastResponseElapsedMs);
-                  saveHistoryToStorage();
-                }
-              } catch {
-                /* ignore malformed sse chunk */
-              }
-            }
+            processSseLine(line);
             lineBreakIndex = buffer.indexOf("\n");
           }
+        }
+
+        const trailingSseLines = buffer.split("\n");
+        for (const trailingLine of trailingSseLines) {
+          processSseLine(trailingLine.trimEnd());
         }
 
         const agentBubbleForAutoSpeech =
@@ -1319,6 +1380,8 @@
         if (lastResponseElapsedMs === null) {
           lastResponseElapsedMs = performance.now() - responseStartedAtMs;
         }
+
+        applyChatResponseTiming(lastResponseElapsedMs, agentBubbleForAutoSpeech);
 
         if (lastRunSucceeded && replyWithSpeechAfterRun && voiceEnabled) {
           await autoSpeakLastAgentReply(agentBubbleForAutoSpeech);

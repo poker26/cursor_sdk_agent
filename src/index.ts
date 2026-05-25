@@ -1037,7 +1037,15 @@ application.post("/api/reset-agent", async (request, response) => {
   });
 });
 
-application.use(express.static(publicDirPath));
+application.use(
+  express.static(publicDirPath, {
+    setHeaders(response, servedFilePath) {
+      if (servedFilePath.endsWith(`${path.sep}index.html`)) {
+        response.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      }
+    },
+  }),
+);
 
 const listenPort = Number.parseInt(process.env.PORT || "3847", 10);
 
