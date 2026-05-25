@@ -56,6 +56,10 @@
         color: var(--error);
         border-color: #6e3030;
       }
+      #status-pill.slow-response {
+        color: #f0c674;
+        border-color: #8b6914;
+      }
       #vpn-indicator {
         display: flex;
         align-items: center;
@@ -403,9 +407,31 @@
         localStorage.setItem(WORKSPACE_STORAGE_KEY, workspaceId);
       }
 
-      function setStatus(label, mode) {
-        statusPillElement.textContent = label;
-        statusPillElement.className = mode || "";
+      const ALICE_SKILL_RESPONSE_LIMIT_MS = 4500;
+
+      function formatResponseDurationLabel(responseElapsedMs) {
+        const secondsRounded = Math.round((responseElapsedMs / 1000) * 10) / 10;
+        return `${secondsRounded} с`;
+      }
+
+      function setStatus(label, mode, responseElapsedMs) {
+        const modeClass = mode || "";
+        statusPillElement.className = modeClass;
+        statusPillElement.classList.remove("slow-response");
+        statusPillElement.removeAttribute("title");
+
+        if (typeof responseElapsedMs !== "number" || responseElapsedMs < 0) {
+          statusPillElement.textContent = label;
+          return;
+        }
+
+        const durationLabel = formatResponseDurationLabel(responseElapsedMs);
+        statusPillElement.textContent = `${label} · ${durationLabel}`;
+        if (responseElapsedMs > ALICE_SKILL_RESPONSE_LIMIT_MS) {
+          statusPillElement.classList.add("slow-response");
+          statusPillElement.title =
+            "Ответ дольше 4,5 с — для навыка Алисы нужен укороченный или двухшаговый сценарий";
+        }
       }
 
       function updateVpnIndicator(probePayload) {
@@ -1157,6 +1183,8 @@
         setComposerEnabled(false);
         setStatus("думает…", "busy");
         let lastRunSucceeded = false;
+        let lastResponseElapsedMs = null;
+        const responseStartedAtMs = performance.now();
 
         const attachmentSnapshot = pendingAttachments.slice();
         const displayText =
@@ -1203,7 +1231,7 @@
             /* plain text */
           }
           appendMessageBubble("error", errorMessage);
-          setStatus("ошибка", "error");
+          setStatus("ошибка", "error", performance.now() - responseStartedAtMs);
           isRequestInFlight = false;
           currentAgentBubbleElement = null;
           setComposerEnabled(true);
@@ -1260,16 +1288,18 @@
                   appendToolHint(label);
                 } else if (event.kind === "run_finished") {
                   lastRunSucceeded = event.status !== "error";
+                  lastResponseElapsedMs = performance.now() - responseStartedAtMs;
                   if (event.status === "error") {
                     appendMessageBubble("error", "Агент завершил run со статусом error");
-                    setStatus("ошибка", "error");
+                    setStatus("ошибка", "error", lastResponseElapsedMs);
                   } else if (!replyWithSpeechAfterRun) {
-                    setStatus("готов", "");
+                    setStatus("готов", "", lastResponseElapsedMs);
                   }
                   saveHistoryToStorage();
                 } else if (event.kind === "error") {
+                  lastResponseElapsedMs = performance.now() - responseStartedAtMs;
                   appendMessageBubble("error", event.message);
-                  setStatus("ошибка", "error");
+                  setStatus("ошибка", "error", lastResponseElapsedMs);
                   saveHistoryToStorage();
                 }
               } catch {
@@ -1286,10 +1316,15 @@
         isRequestInFlight = false;
         setComposerEnabled(true);
 
+        if (lastResponseElapsedMs === null) {
+          lastResponseElapsedMs = performance.now() - responseStartedAtMs;
+        }
+
         if (lastRunSucceeded && replyWithSpeechAfterRun && voiceEnabled) {
           await autoSpeakLastAgentReply(agentBubbleForAutoSpeech);
-        } else if (statusPillElement.className !== "error" && !activeSpeakButtonElement) {
-          setStatus("готов", "");
+        }
+        if (statusPillElement.className !== "error" && !activeSpeakButtonElement) {
+          setStatus("готов", "", lastResponseElapsedMs);
         }
 
         currentAgentBubbleElement = null;
