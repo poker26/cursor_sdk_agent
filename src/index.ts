@@ -46,6 +46,7 @@ import {
 } from "./vpn-health.js";
 import { getVoicePublicConfig } from "./voice/config.js";
 import { registerVoiceRoutes } from "./voice/routes.js";
+import { registerVoiceTurnRoute } from "./voice/voice-turn.js";
 import {
   buildChatResponseStylePrefix,
   buildChatResponseStyleSuffix,
@@ -584,14 +585,18 @@ function describeStreamMessageForClient(message: SDKMessage): Record<string, unk
   return null;
 }
 
-async function streamAgentRunToClient(
+interface AgentRunStreamOptions {
+  onAssistantText: (textDelta: string) => void;
+  shouldContinue: () => boolean;
+  writeClientEvent?: (payload: Record<string, unknown>) => void;
+}
+
+async function runAgentStreamToCompletion(
   agentRun: Run,
-  response: express.Response,
-  isClientStillConnected: () => boolean,
-  onAssistantText: (textDelta: string) => void,
+  streamOptions: AgentRunStreamOptions,
 ): Promise<{ status: string; result?: string; runId: string }> {
   for await (const streamMessage of agentRun.stream()) {
-    if (!isClientStillConnected()) {
+    if (!streamOptions.shouldContinue()) {
       if (agentRun.supports("cancel")) {
         try {
           await agentRun.cancel();
@@ -606,31 +611,51 @@ async function streamAgentRunToClient(
     if (streamMessage.type === "assistant") {
       const textDelta = extractAssistantTextDelta(streamMessage);
       if (textDelta) {
-        onAssistantText(textDelta);
+        streamOptions.onAssistantText(textDelta);
       }
     }
     const clientPayload = describeStreamMessageForClient(streamMessage);
-    if (clientPayload) {
-      writeSseDataLine(response, clientPayload);
+    if (clientPayload && streamOptions.writeClientEvent) {
+      streamOptions.writeClientEvent(clientPayload);
     }
   }
 
-  if (!isClientStillConnected()) {
+  if (!streamOptions.shouldContinue()) {
     return { status: "cancelled", runId: agentRun.id };
   }
 
   const terminalResult = await agentRun.wait();
-  writeSseDataLine(response, {
-    kind: "run_finished",
-    status: terminalResult.status,
-    result: terminalResult.result,
-    runId: agentRun.id,
-  });
+  if (streamOptions.writeClientEvent) {
+    streamOptions.writeClientEvent({
+      kind: "run_finished",
+      status: terminalResult.status,
+      result: terminalResult.result,
+      runId: agentRun.id,
+    });
+  }
   return {
     status: terminalResult.status,
     result: terminalResult.result,
     runId: agentRun.id,
   };
+}
+
+async function streamAgentRunToClient(
+  agentRun: Run,
+  response: express.Response,
+  isClientStillConnected: () => boolean,
+  onAssistantText: (textDelta: string) => void,
+): Promise<{ status: string; result?: string; runId: string }> {
+  return runAgentStreamToCompletion(agentRun, {
+    onAssistantText,
+    shouldContinue: isClientStillConnected,
+    writeClientEvent: (payload) => writeSseDataLine(response, payload),
+  });
+}
+
+interface ChatMessageRunResult {
+  assistantText: string;
+  runOutcome: { status: string; result?: string; runId: string };
 }
 
 function prependTextToUserPayload(
@@ -665,19 +690,20 @@ function appendTextToUserPayload(
   };
 }
 
-async function executeChatMessageForWorkspace(
+async function executeChatMessageCore(
   workspace: WorkspaceEntry,
-  sessionId: string,
   userMessagePayload: string | SDKUserMessage,
   userMessageText: string,
-  response: express.Response,
-  isClientStillConnected: () => boolean,
+  streamSink: {
+    shouldContinue: () => boolean;
+    writeClientEvent?: (payload: Record<string, unknown>) => void;
+  },
   options: {
     forceLocalRun: boolean;
     recreateWorkspaceAgent: boolean;
     responseMode: ChatResponseMode;
   },
-): Promise<void> {
+): Promise<ChatMessageRunResult> {
   if (options.recreateWorkspaceAgent) {
     await disposeWorkspaceAgent(workspace.id, "recreate before retry");
     await clearPersistedAgentId(workspace.id);
@@ -708,14 +734,13 @@ async function executeChatMessageForWorkspace(
   const agentRun = await workspaceRecord.agent.send(payloadWithBrain, sendOptions);
 
   let assistantAccumulatedText = "";
-  const runOutcome = await streamAgentRunToClient(
-    agentRun,
-    response,
-    isClientStillConnected,
-    (textDelta) => {
+  const runOutcome = await runAgentStreamToCompletion(agentRun, {
+    onAssistantText: (textDelta) => {
       assistantAccumulatedText += textDelta;
     },
-  );
+    shouldContinue: streamSink.shouldContinue,
+    writeClientEvent: streamSink.writeClientEvent,
+  });
 
   const isVoiceResponseMode = options.responseMode === "voice";
   const sanitizedAssistantText = isVoiceResponseMode
@@ -725,15 +750,16 @@ async function executeChatMessageForWorkspace(
     isVoiceResponseMode &&
     sanitizedAssistantText &&
     sanitizedAssistantText !== assistantAccumulatedText &&
-    isClientStillConnected()
+    streamSink.shouldContinue() &&
+    streamSink.writeClientEvent
   ) {
-    writeSseDataLine(response, {
+    streamSink.writeClientEvent({
       kind: "assistant_text_final",
       text: sanitizedAssistantText,
     });
   }
 
-  if (runOutcome.status !== "error" && isClientStillConnected()) {
+  if (runOutcome.status !== "error" && streamSink.shouldContinue()) {
     try {
       await persistBrainAfterRun({
         workspaceId: workspace.id,
@@ -748,6 +774,102 @@ async function executeChatMessageForWorkspace(
         `brain persist failed: ${brainError instanceof Error ? brainError.message : String(brainError)}`,
       );
     }
+  }
+
+  return { assistantText: sanitizedAssistantText, runOutcome };
+}
+
+async function executeChatMessageForWorkspace(
+  workspace: WorkspaceEntry,
+  sessionId: string,
+  userMessagePayload: string | SDKUserMessage,
+  userMessageText: string,
+  response: express.Response,
+  isClientStillConnected: () => boolean,
+  options: {
+    forceLocalRun: boolean;
+    recreateWorkspaceAgent: boolean;
+    responseMode: ChatResponseMode;
+  },
+): Promise<void> {
+  await executeChatMessageCore(
+    workspace,
+    userMessagePayload,
+    userMessageText,
+    {
+      shouldContinue: isClientStillConnected,
+      writeClientEvent: (payload) => writeSseDataLine(response, payload),
+    },
+    options,
+  );
+}
+
+function releaseChatTurnLocks(sessionId: string, workspaceId: string): void {
+  const sessionLockRecord = sessionLocks.get(sessionId);
+  if (sessionLockRecord) {
+    sessionLockRecord.busy = false;
+  }
+  const updatedWorkspace = workspaceAgents.get(workspaceId);
+  if (updatedWorkspace) {
+    updatedWorkspace.busy = false;
+    touchWorkspaceActivity(updatedWorkspace);
+    scheduleWorkspaceIdleDispose(workspaceId, updatedWorkspace);
+  }
+}
+
+async function runChatTurnWithRetry(
+  workspace: WorkspaceEntry,
+  sessionId: string,
+  userMessagePayload: string | SDKUserMessage,
+  userMessageText: string,
+  responseMode: ChatResponseMode,
+  streamSink: {
+    shouldContinue: () => boolean;
+    writeClientEvent?: (payload: Record<string, unknown>) => void;
+  },
+): Promise<ChatMessageRunResult> {
+  try {
+    return await executeChatMessageCore(
+      workspace,
+      userMessagePayload,
+      userMessageText,
+      streamSink,
+      { forceLocalRun: false, recreateWorkspaceAgent: false, responseMode },
+    );
+  } catch (firstAttemptError) {
+    const normalizedError = normalizeThrownError(firstAttemptError);
+    const agentIsBusy = isAgentBusyFailure(firstAttemptError);
+    const shouldRecreateWorkspaceAgent =
+      isAuthenticationFailure(firstAttemptError) || agentIsBusy;
+    const shouldForceLocalRun = agentIsBusy || shouldRecreateWorkspaceAgent;
+
+    if (!shouldRecreateWorkspaceAgent && !shouldForceLocalRun) {
+      throw normalizedError;
+    }
+
+    if (agentIsBusy) {
+      await recoverStuckWorkspaceAgent(workspace.id, "active run conflict before retry");
+    }
+
+    logServerMessage(
+      `workspace ${workspace.id} retry: recreate=${shouldRecreateWorkspaceAgent} force=${shouldForceLocalRun} (${normalizedError.message})`,
+    );
+
+    if (!streamSink.shouldContinue()) {
+      throw normalizedError;
+    }
+
+    return await executeChatMessageCore(
+      workspace,
+      userMessagePayload,
+      userMessageText,
+      streamSink,
+      {
+        forceLocalRun: shouldForceLocalRun || shouldRecreateWorkspaceAgent,
+        recreateWorkspaceAgent: shouldRecreateWorkspaceAgent,
+        responseMode,
+      },
+    );
   }
 }
 
@@ -800,6 +922,34 @@ application.get("/api/config", (_request, response) => {
 });
 
 registerVoiceRoutes(application);
+
+registerVoiceTurnRoute(application, {
+  normalizeSessionId,
+  resolveWorkspace,
+  buildUserMessagePayload,
+  isSessionBusy: (sessionId) => sessionLocks.get(sessionId)?.busy === true,
+  isWorkspaceBusy: (workspaceId) => workspaceAgents.get(workspaceId)?.busy === true,
+  acquireChatTurnLocks: async (sessionId, workspaceId) => {
+    const workspaceForLock = resolveWorkspace(workspaceId);
+    sessionLocks.set(sessionId, { busy: true, workspaceId: workspaceForLock.id });
+    const ensuredWorkspace = await getOrCreateWorkspaceAgent(workspaceForLock);
+    ensuredWorkspace.busy = true;
+    touchWorkspaceActivity(ensuredWorkspace);
+    clearWorkspaceIdleTimer(ensuredWorkspace);
+  },
+  releaseChatTurnLocks,
+  runChatTurnWithRetry: (workspace, sessionId, userMessagePayload, userMessageText, responseMode) =>
+    runChatTurnWithRetry(workspace, sessionId, userMessagePayload, userMessageText, responseMode, {
+      shouldContinue: () => true,
+    }),
+  recoverWorkspaceAfterFailure: async (workspaceId, reason, error) => {
+    if (isAuthenticationFailure(error)) {
+      await recoverStuckWorkspaceAgent(workspaceId, reason);
+    } else if (isAgentBusyFailure(error)) {
+      await recoverStuckWorkspaceAgent(workspaceId, reason);
+    }
+  },
+});
 
 application.get("/api/vpn-health", async (_request, response) => {
   const probeResult = await probeVpnHealth();

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cursor Voice</string>
+    <string name="settings_title">Настройки</string>
+    <string name="listen_button">Слушать</string>
+    <string name="stop_button">Стоп</string>
+    <string name="settings_button">Настройки</string>
+    <string name="start_service">Запустить фоновый режим</string>
+    <string name="stop_service">Остановить фон</string>
+    <string name="status_idle">Готов</string>
+    <string name="status_listening">Слушаю команду…</string>
+    <string name="status_thinking">Думаю…</string>
+    <string name="status_speaking">Озвучиваю…</string>
+    <string name="status_wake">Жду wake-фразу…</string>
+    <string name="notification_channel_name">Голосовой агент</string>
+    <string name="notification_title">Cursor Voice слушает</string>
+    <string name="notification_text">Wake-фраза активна</string>
+    <string name="gateway_url_hint">https://cursor.begemot26.ru</string>
+    <string name="basic_user_hint">Basic auth user (опционально)</string>
+    <string name="basic_password_hint">Basic auth password</string>
+    <string name="workspace_hint">workspace id</string>
+    <string name="wake_phrase_hint">эй агент</string>
+    <string name="save_settings">Сохранить</string>
+    <string name="model_missing">Скопируйте Vosk model-small-ru в assets/model-small-ru (см. README)</string>
+</resources>
