@@ -28,9 +28,9 @@ class SettingsActivity : AppCompatActivity() {
             appPreferences.basicAuthUser = activityBinding.basicUserInput.text?.toString().orEmpty()
             appPreferences.basicAuthPassword =
                 activityBinding.basicPasswordInput.text?.toString().orEmpty()
-            appPreferences.workspaceId =
-                activityBinding.workspaceInput.text?.toString()?.trim().ifBlank { "default" }
-                    ?: "default"
+            val workspaceIdRaw =
+                activityBinding.workspaceInput.text?.toString()?.trim().orEmpty()
+            appPreferences.workspaceId = workspaceIdRaw.ifBlank { "default" }
             appPreferences.wakePhrase =
                 activityBinding.wakePhraseInput.text?.toString()?.trim()
                     ?: AppPreferences.DEFAULT_WAKE_PHRASE

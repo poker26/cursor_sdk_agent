@@ -111,14 +111,13 @@ class VoiceTurnOrchestrator(
                             errorText
                         }
                     speakErrorMessage(speechErrorText)
-                    return
+                } else {
+                    appPreferences.lastAssistantText = turnResult.assistantText
+                    stateListener.onLogLine(
+                        "Агент (${turnResult.durationMs} мс): ${turnResult.assistantText}",
+                    )
+                    playAssistantSpeech(turnResult.assistantText)
                 }
-
-                appPreferences.lastAssistantText = turnResult.assistantText
-                stateListener.onLogLine(
-                    "Агент (${turnResult.durationMs} мс): ${turnResult.assistantText}",
-                )
-                playAssistantSpeech(turnResult.assistantText)
             } catch (runError: Exception) {
                 val message = runError.message ?: runError.toString()
                 stateListener.onLogLine("Сбой: $message")

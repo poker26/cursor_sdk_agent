@@ -72,7 +72,7 @@ class AgentApiClient(private val appPreferences: AppPreferences) {
             val responseBodyText = response.body?.string() ?: ""
             val responseJson = try {
                 JSONObject(responseBodyText)
-            } catch {
+            } catch (_: Exception) {
                 throw IllegalStateException("Некорректный JSON: $responseBodyText")
             }
 
@@ -93,7 +93,7 @@ class AgentApiClient(private val appPreferences: AppPreferences) {
                 assistantText = responseJson.optString("assistantText", ""),
                 durationMs = responseJson.optLong("durationMs", 0),
                 status = responseJson.optString("status", ""),
-                errorMessage = responseJson.optString("error", null),
+                errorMessage = responseJson.optString("error", "").ifBlank { null },
             )
         }
     }
