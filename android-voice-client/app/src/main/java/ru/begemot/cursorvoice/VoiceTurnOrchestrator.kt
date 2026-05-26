@@ -7,6 +7,7 @@ import java.io.File
 enum class VoiceClientState {
     IDLE,
     LISTENING,
+    DIALOG_LISTENING,
     THINKING,
     SPEAKING,
     WAKE_LISTENING,
@@ -84,6 +85,10 @@ class VoiceTurnOrchestrator(
             return
         }
         runVoiceTurn(recordedUtterance)
+    }
+
+    fun runVoiceTurnFromDialog(recordedUtterance: RecordedUtterance) {
+        runVoiceTurnFromWake(recordedUtterance)
     }
 
     fun stopPlayback() {

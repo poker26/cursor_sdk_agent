@@ -17,16 +17,24 @@ class VoiceForegroundService : Service(), VoiceStateListener {
     private lateinit var appPreferences: AppPreferences
     private lateinit var voiceTurnOrchestrator: VoiceTurnOrchestrator
     private var wakeWordEngine: WakeWordEngine? = null
+    private var dialogCommandRecorder: DialogCommandRecorder? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isRecordingCommand = false
     private var lastWakeTriggeredAtMs = 0L
+    private var isDialogSessionActive = false
 
     override fun onCreate() {
         super.onCreate()
         appPreferences = AppPreferences(applicationContext)
         voiceTurnOrchestrator = VoiceTurnOrchestrator(applicationContext, appPreferences, this)
         voiceTurnOrchestrator.onTurnFullyFinished = {
-            mainHandler.post { scheduleRestartWakeListening() }
+            mainHandler.post {
+                if (isDialogSessionActive) {
+                    scheduleEnterDialogListening()
+                } else {
+                    scheduleRestartWakeListening()
+                }
+            }
         }
         createNotificationChannel()
     }
@@ -35,23 +43,16 @@ class VoiceForegroundService : Service(), VoiceStateListener {
         val notification = buildForegroundNotification("Запуск…")
         startForeground(NOTIFICATION_ID, notification)
 
-        val wakePhrase = appPreferences.wakePhrase
-        wakeWordEngine?.stopListening()
-        wakeWordEngine = WakeWordEngine(applicationContext, wakePhrase) {
-            mainHandler.post { handleWakePhraseDetected() }
-        }
-
-        if (wakeWordEngine?.startListening() == true) {
-            onStateChanged(VoiceClientState.WAKE_LISTENING, "Жду: $wakePhrase")
-        } else {
-            onStateChanged(VoiceClientState.IDLE, "Нет Vosk-модели")
-            onLogLine(getString(R.string.model_missing))
-        }
+        isDialogSessionActive = false
+        dialogCommandRecorder?.stop()
+        startWakeListening()
 
         return START_STICKY
     }
 
     override fun onDestroy() {
+        dialogCommandRecorder?.stop()
+        dialogCommandRecorder = null
         wakeWordEngine?.stopListening()
         wakeWordEngine = null
         voiceTurnOrchestrator.stopPlayback()
@@ -63,6 +64,7 @@ class VoiceForegroundService : Service(), VoiceStateListener {
     override fun onStateChanged(state: VoiceClientState, statusLine: String) {
         val notificationText = when (state) {
             VoiceClientState.WAKE_LISTENING -> statusLine
+            VoiceClientState.DIALOG_LISTENING -> statusLine
             VoiceClientState.LISTENING -> statusLine
             VoiceClientState.THINKING -> statusLine
             VoiceClientState.SPEAKING -> statusLine
@@ -88,7 +90,9 @@ class VoiceForegroundService : Service(), VoiceStateListener {
             return
         }
         lastWakeTriggeredAtMs = nowMs
+        isDialogSessionActive = true
         isRecordingCommand = true
+        dialogCommandRecorder?.stop()
         wakeWordEngine?.stopListening()
         voiceTurnOrchestrator.startPushToTalkRecording()
         onStateChanged(VoiceClientState.LISTENING, "Слушаю команду…")
@@ -97,6 +101,76 @@ class VoiceForegroundService : Service(), VoiceStateListener {
             voiceTurnOrchestrator.finishPushToTalkAndRunTurn()
             isRecordingCommand = false
         }, COMMAND_RECORDING_MS)
+    }
+
+    private fun scheduleEnterDialogListening() {
+        mainHandler.postDelayed({ enterDialogListening() }, DIALOG_RESTART_DELAY_MS)
+    }
+
+    private fun enterDialogListening() {
+        if (!isDialogSessionActive) {
+            scheduleRestartWakeListening()
+            return
+        }
+        if (voiceTurnOrchestrator.isBusy() || isRecordingCommand) {
+            mainHandler.postDelayed({ enterDialogListening() }, 1500)
+            return
+        }
+
+        wakeWordEngine?.stopListening()
+        dialogCommandRecorder?.stop()
+
+        val dialogRecorder = DialogCommandRecorder(applicationContext)
+        dialogCommandRecorder = dialogRecorder
+
+        val idleTimeoutMs = appPreferences.dialogIdleTimeoutMs
+        dialogRecorder.start(
+            idleTimeoutMs = idleTimeoutMs,
+            onUtteranceReady = { recordedUtterance ->
+                mainHandler.post {
+                    if (voiceTurnOrchestrator.isBusy() || isRecordingCommand) {
+                        return@post
+                    }
+                    dialogCommandRecorder?.stop()
+                    onStateChanged(VoiceClientState.LISTENING, "Слушаю команду…")
+                    voiceTurnOrchestrator.runVoiceTurnFromDialog(recordedUtterance)
+                }
+            },
+            onIdleTimeout = {
+                mainHandler.post { exitDialogSession() }
+            },
+            onNoSpeechCaptured = {
+                mainHandler.post { scheduleEnterDialogListening() }
+            },
+            onStatusChanged = { statusLine ->
+                mainHandler.post {
+                    onStateChanged(VoiceClientState.DIALOG_LISTENING, statusLine)
+                }
+            },
+        )
+    }
+
+    private fun exitDialogSession() {
+        isDialogSessionActive = false
+        dialogCommandRecorder?.stop()
+        dialogCommandRecorder = null
+        onLogLine("Минута тишины — снова жду wake-фразу")
+        restartWakeListening()
+    }
+
+    private fun startWakeListening() {
+        val wakePhrase = appPreferences.wakePhrase
+        wakeWordEngine?.stopListening()
+        wakeWordEngine = WakeWordEngine(applicationContext, wakePhrase) {
+            mainHandler.post { handleWakePhraseDetected() }
+        }
+
+        if (wakeWordEngine?.startListening() == true) {
+            onStateChanged(VoiceClientState.WAKE_LISTENING, "Жду: $wakePhrase")
+        } else {
+            onStateChanged(VoiceClientState.IDLE, "Нет Vosk-модели")
+            onLogLine(getString(R.string.model_missing))
+        }
     }
 
     private fun scheduleRestartWakeListening() {
@@ -109,6 +183,8 @@ class VoiceForegroundService : Service(), VoiceStateListener {
             return
         }
 
+        dialogCommandRecorder?.stop()
+        dialogCommandRecorder = null
         wakeWordEngine?.stopListening()
 
         val wakePhrase = appPreferences.wakePhrase
@@ -174,5 +250,6 @@ class VoiceForegroundService : Service(), VoiceStateListener {
         private const val COMMAND_RECORDING_MS = 6000L
         private const val WAKE_COOLDOWN_MS = 4000L
         private const val WAKE_RESTART_DELAY_MS = 800L
+        private const val DIALOG_RESTART_DELAY_MS = 800L
     }
 }

@@ -8,3 +8,10 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+
+# Vosk model — ставится локально, не в git (см. assets/model-small-ru/README.txt)
+/app/src/main/assets/model-small-ru/am/
+/app/src/main/assets/model-small-ru/conf/
+/app/src/main/assets/model-small-ru/graph/
+/app/src/main/assets/model-small-ru/ivector/
+/app/src/main/assets/model-small-ru/*.mdl

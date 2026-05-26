@@ -32,6 +32,10 @@ export async function prepareAudioBufferForYandexStt(
     const convertedBuffer = await convertAudioWithFfmpeg(audioBuffer, "m4a", "ogg");
     return { audioBuffer: convertedBuffer, format: "oggopus" };
   }
+  if (normalizedMimeType.includes("wav") || normalizedMimeType.includes("wave")) {
+    const convertedBuffer = await convertAudioWithFfmpeg(audioBuffer, "wav", "ogg");
+    return { audioBuffer: convertedBuffer, format: "oggopus" };
+  }
   throw new Error(
     `Неподдерживаемый формат аудио (${mimeType || "unknown"}). Запишите через Chrome или установите ffmpeg на сервере.`,
   );

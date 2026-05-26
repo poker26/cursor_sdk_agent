@@ -13,6 +13,7 @@
     <string name="status_thinking">Думаю…</string>
     <string name="status_speaking">Озвучиваю…</string>
     <string name="status_wake">Жду wake-фразу…</string>
+    <string name="status_dialog">Диалог: говорите…</string>
     <string name="notification_channel_name">Голосовой агент</string>
     <string name="notification_title">Cursor Voice слушает</string>
     <string name="notification_text">Wake-фраза активна</string>

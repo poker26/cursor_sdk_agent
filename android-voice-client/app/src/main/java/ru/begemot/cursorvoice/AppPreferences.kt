@@ -47,6 +47,10 @@ class AppPreferences(context: Context) {
         get() = sharedPreferences.getString(KEY_LAST_ASSISTANT_TEXT, "") ?: ""
         set(value) = sharedPreferences.edit().putString(KEY_LAST_ASSISTANT_TEXT, value).apply()
 
+    var dialogIdleTimeoutMs: Long
+        get() = sharedPreferences.getLong(KEY_DIALOG_IDLE_MS, DEFAULT_DIALOG_IDLE_TIMEOUT_MS)
+        set(value) = sharedPreferences.edit().putLong(KEY_DIALOG_IDLE_MS, value).apply()
+
     companion object {
         private const val PREFERENCES_NAME = "cursor_voice_prefs"
         private const val KEY_GATEWAY_URL = "gateway_url"
@@ -59,5 +63,7 @@ class AppPreferences(context: Context) {
         private const val KEY_LAST_ASSISTANT_TEXT = "last_assistant_text"
         const val DEFAULT_GATEWAY_URL = "https://cursor.begemot26.ru"
         const val DEFAULT_WAKE_PHRASE = "эй агент"
+        const val DEFAULT_DIALOG_IDLE_TIMEOUT_MS = 60_000L
+        private const val KEY_DIALOG_IDLE_MS = "dialog_idle_timeout_ms"
     }
 }
