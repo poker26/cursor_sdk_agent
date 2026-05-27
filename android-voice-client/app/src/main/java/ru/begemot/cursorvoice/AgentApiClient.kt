@@ -15,6 +15,8 @@ data class VoiceTurnResult(
     val durationMs: Long,
     val status: String,
     val errorMessage: String?,
+    val speechText: String?,
+    val errorDetail: String?,
 )
 
 class AgentApiClient(private val appPreferences: AppPreferences) {
@@ -77,25 +79,27 @@ class AgentApiClient(private val appPreferences: AppPreferences) {
             }
 
             if (!response.isSuccessful) {
-                return VoiceTurnResult(
-                    ok = false,
-                    userText = responseJson.optString("userText", ""),
-                    assistantText = responseJson.optString("assistantText", ""),
-                    durationMs = responseJson.optLong("durationMs", 0),
-                    status = responseJson.optString("status", "error"),
-                    errorMessage = responseJson.optString("error", "HTTP ${response.code}"),
-                )
+                return parseVoiceTurnResult(responseJson, ok = false)
             }
 
-            return VoiceTurnResult(
-                ok = responseJson.optBoolean("ok", false),
-                userText = responseJson.optString("userText", ""),
-                assistantText = responseJson.optString("assistantText", ""),
-                durationMs = responseJson.optLong("durationMs", 0),
-                status = responseJson.optString("status", ""),
-                errorMessage = responseJson.optString("error", "").ifBlank { null },
-            )
+            return parseVoiceTurnResult(responseJson, ok = responseJson.optBoolean("ok", false))
         }
+    }
+
+    private fun parseVoiceTurnResult(responseJson: JSONObject, ok: Boolean): VoiceTurnResult {
+        val errorMessage = responseJson.optString("error", "").ifBlank { null }
+        val errorDetail = responseJson.optString("errorDetail", "").ifBlank { null }
+        val speechText = responseJson.optString("speechText", "").ifBlank { null }
+        return VoiceTurnResult(
+            ok = ok,
+            userText = responseJson.optString("userText", ""),
+            assistantText = responseJson.optString("assistantText", ""),
+            durationMs = responseJson.optLong("durationMs", 0),
+            status = responseJson.optString("status", ""),
+            errorMessage = errorMessage,
+            speechText = speechText,
+            errorDetail = errorDetail ?: errorMessage,
+        )
     }
 
     private fun buildAuthorizedRequest(pathSuffix: String): Request.Builder {

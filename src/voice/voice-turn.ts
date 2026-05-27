@@ -5,6 +5,7 @@ import type { WorkspaceEntry } from "../workspace-registry.js";
 import { guessMimeTypeFromFilename } from "./audio-convert.js";
 import { isVoiceEnabled, loadYandexVoiceConfig } from "./config.js";
 import { transcribeAudioWithYandex } from "./yandex-stt.js";
+import { buildVoiceTurnErrorPayload } from "./voice-error-speech.js";
 
 interface VoiceTurnRequestBody {
   message?: string;
@@ -206,9 +207,30 @@ export function registerVoiceTurnRoute(
 
       const durationMs = Date.now() - turnStartedAtMs;
       const runStatus = chatResult.runOutcome.status;
+      const runSucceeded = runStatus !== "error" && runStatus !== "cancelled";
+
+      if (!runSucceeded) {
+        const runErrorDetail =
+          chatResult.runOutcome.result?.trim() ||
+          `Агент завершил run со статусом ${runStatus}`;
+        const errorPayload = buildVoiceTurnErrorPayload(runErrorDetail);
+        response.json({
+          ok: false,
+          sessionId,
+          workspaceId: workspace.id,
+          modelId: resolvedModelId,
+          userText: userMessageText,
+          assistantText: errorPayload.assistantText,
+          durationMs,
+          status: runStatus,
+          runId: chatResult.runOutcome.runId,
+          ...errorPayload,
+        });
+        return;
+      }
 
       response.json({
-        ok: runStatus !== "error" && runStatus !== "cancelled",
+        ok: true,
         sessionId,
         workspaceId: workspace.id,
         modelId: resolvedModelId,
@@ -221,15 +243,15 @@ export function registerVoiceTurnRoute(
     } catch (error) {
       await host.recoverWorkspaceAfterFailure(workspace.id, "voice turn failed", error);
       const normalizedMessage = error instanceof Error ? error.message : String(error);
+      const errorPayload = buildVoiceTurnErrorPayload(normalizedMessage);
       response.status(500).json({
         ok: false,
         sessionId,
         workspaceId: workspace.id,
         userText: userMessageText,
-        assistantText: "",
         durationMs: Date.now() - turnStartedAtMs,
         status: "error",
-        error: normalizedMessage,
+        ...errorPayload,
       });
     } finally {
       host.releaseChatTurnLocks(sessionId, workspace.id);

@@ -402,6 +402,8 @@
       let vpnHealthPollTimer = null;
       let voiceEnabled = false;
       let voiceAutoSend = true;
+      let voiceErrorBriefSpeech = "Не удалось выполнить запрос. Подробности в чате.";
+      let voiceErrorBusySpeech = "Подождите, агент занят. Повторите через минуту.";
       let voiceMediaRecorder = null;
       let voiceRecordingStream = null;
       let voiceRecordedChunks = [];
@@ -661,6 +663,60 @@
         });
       }
 
+      function resolveVoiceErrorBriefSpeech(errorDetailText) {
+        if (errorDetailText && /занят/i.test(errorDetailText)) {
+          return voiceErrorBusySpeech;
+        }
+        return voiceErrorBriefSpeech;
+      }
+
+      async function playVoiceBriefNotice(noticeText) {
+        const trimmedNotice = (noticeText || "").trim();
+        if (!voiceEnabled || !trimmedNotice) {
+          return;
+        }
+        stopSpeechPlayback();
+        setStatus("озвучивание…", "busy");
+        try {
+          const synthesizeResponse = await fetch("/api/voice/synthesize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: trimmedNotice }),
+          });
+          if (!synthesizeResponse.ok) {
+            setStatus("ошибка", "error", lastChatResponseElapsedMs);
+            return;
+          }
+          const audioBlob = await synthesizeResponse.blob();
+          currentSpeechObjectUrl = URL.createObjectURL(audioBlob);
+          const audioElement = new Audio(currentSpeechObjectUrl);
+          currentSpeechAudio = audioElement;
+          audioElement.onended = () => {
+            if (currentSpeechAudio === audioElement) {
+              stopSpeechPlayback();
+            }
+          };
+          await audioElement.play();
+        } catch {
+          setStatus("ошибка", "error", lastChatResponseElapsedMs);
+        }
+      }
+
+      async function reportChatError(errorDetailText, elapsedMs, options) {
+        const detailText = (errorDetailText || "Неизвестная ошибка").trim();
+        appendMessageBubble("error", detailText);
+        setStatus("ошибка", "error", elapsedMs);
+        saveHistoryToStorage();
+        const shouldSpeakNow =
+          options &&
+          options.voiceRequest &&
+          options.speakBriefNow !== false;
+        if (shouldSpeakNow) {
+          await playVoiceBriefNotice(resolveVoiceErrorBriefSpeech(detailText));
+        }
+        return detailText;
+      }
+
       async function handleSpeakButtonClick(speakButtonElement, textElement) {
         if (!voiceEnabled) {
           return;
@@ -905,8 +961,11 @@
         });
         const transcribeBody = await transcribeResponse.json();
         if (!transcribeResponse.ok) {
-          appendMessageBubble("error", transcribeBody.error || "Ошибка распознавания речи");
-          setStatus("ошибка", "error");
+          await reportChatError(
+            transcribeBody.error || "Ошибка распознавания речи",
+            null,
+            { voiceRequest: true },
+          );
           return;
         }
         const recognizedText = (transcribeBody.text || "").trim();
@@ -1135,6 +1194,12 @@
         if (config.voice && config.voice.enabled) {
           voiceEnabled = true;
           voiceAutoSend = config.voice.autoSend !== false;
+          if (config.voice.errorBriefSpeech) {
+            voiceErrorBriefSpeech = config.voice.errorBriefSpeech;
+          }
+          if (config.voice.errorBusySpeech) {
+            voiceErrorBusySpeech = config.voice.errorBusySpeech;
+          }
           voiceRecordButton.hidden = false;
         } else {
           voiceEnabled = false;
@@ -1268,6 +1333,7 @@
         setStatus("думает…", "busy");
         let lastRunSucceeded = false;
         let lastResponseElapsedMs = null;
+        let voiceRunErrorDetail = null;
         const responseStartedAtMs = performance.now();
 
         const attachmentSnapshot = pendingAttachments.slice();
@@ -1320,8 +1386,9 @@
           } catch {
             /* plain text */
           }
-          appendMessageBubble("error", errorMessage);
-          setStatus("ошибка", "error", performance.now() - responseStartedAtMs);
+          await reportChatError(errorMessage, performance.now() - responseStartedAtMs, {
+            voiceRequest: replyWithSpeechAfterRun,
+          });
           isRequestInFlight = false;
           currentAgentBubbleElement = null;
           setComposerEnabled(true);
@@ -1377,15 +1444,18 @@
               if (event.runId) {
                 errorDetail += "\n\nrunId: " + event.runId;
               }
+              voiceRunErrorDetail = errorDetail;
               appendMessageBubble("error", errorDetail);
               setStatus("ошибка", "error", lastResponseElapsedMs);
+              saveHistoryToStorage();
             } else if (!replyWithSpeechAfterRun) {
               setStatus("готов", "", lastResponseElapsedMs);
             }
             saveHistoryToStorage();
           } else if (event.kind === "error") {
             lastResponseElapsedMs = performance.now() - responseStartedAtMs;
-            appendMessageBubble("error", event.message);
+            voiceRunErrorDetail = event.message || "Ошибка запроса";
+            appendMessageBubble("error", voiceRunErrorDetail);
             setStatus("ошибка", "error", lastResponseElapsedMs);
             saveHistoryToStorage();
           }
@@ -1445,6 +1515,8 @@
 
         if (lastRunSucceeded && replyWithSpeechAfterRun && voiceEnabled) {
           await autoSpeakLastAgentReply(agentBubbleForAutoSpeech);
+        } else if (voiceRunErrorDetail && replyWithSpeechAfterRun && voiceEnabled) {
+          await playVoiceBriefNotice(resolveVoiceErrorBriefSpeech(voiceRunErrorDetail));
         }
         if (statusPillElement.className !== "error" && !activeSpeakButtonElement) {
           setStatus("готов", "", lastResponseElapsedMs);

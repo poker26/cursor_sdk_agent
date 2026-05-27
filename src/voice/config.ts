@@ -1,3 +1,8 @@
+import {
+  getVoiceErrorBriefSpeechText,
+  getVoiceErrorBusySpeechText,
+} from "./voice-error-speech.js";
+
 export interface YandexVoiceConfig {
   apiKey: string;
   folderId: string;
@@ -75,6 +80,8 @@ export function getVoicePublicConfig(): {
   sttLang: string;
   ttsVoice: string;
   ttsLang: string;
+  errorBriefSpeech: string;
+  errorBusySpeech: string;
 } {
   if (!isVoiceEnabled()) {
     return {
@@ -83,6 +90,8 @@ export function getVoicePublicConfig(): {
       sttLang: DEFAULT_STT_LANG,
       ttsVoice: DEFAULT_TTS_VOICE,
       ttsLang: DEFAULT_TTS_LANG,
+      errorBriefSpeech: getVoiceErrorBriefSpeechText(),
+      errorBusySpeech: getVoiceErrorBusySpeechText(),
     };
   }
   try {
@@ -93,6 +102,8 @@ export function getVoicePublicConfig(): {
       sttLang: config.sttLang,
       ttsVoice: config.ttsVoice,
       ttsLang: config.ttsLang,
+      errorBriefSpeech: getVoiceErrorBriefSpeechText(),
+      errorBusySpeech: getVoiceErrorBusySpeechText(),
     };
   } catch {
     return {
@@ -101,6 +112,8 @@ export function getVoicePublicConfig(): {
       sttLang: DEFAULT_STT_LANG,
       ttsVoice: DEFAULT_TTS_VOICE,
       ttsLang: DEFAULT_TTS_LANG,
+      errorBriefSpeech: getVoiceErrorBriefSpeechText(),
+      errorBusySpeech: getVoiceErrorBusySpeechText(),
     };
   }
 }

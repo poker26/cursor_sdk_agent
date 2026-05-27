@@ -110,14 +110,18 @@ class VoiceTurnOrchestrator(
 
                 stateListener.onLogLine("Вы: ${turnResult.userText}")
                 if (!turnResult.ok || turnResult.assistantText.isBlank()) {
-                    val errorText = turnResult.errorMessage ?: "Пустой ответ агента"
+                    val errorText =
+                        turnResult.errorDetail
+                            ?: turnResult.errorMessage
+                            ?: "Пустой ответ агента"
                     stateListener.onLogLine("Ошибка: $errorText (${turnResult.durationMs} мс)")
                     val speechErrorText =
-                        if (errorText.contains("занят", ignoreCase = true)) {
-                            "Подождите, агент занят"
-                        } else {
-                            errorText
-                        }
+                        turnResult.speechText?.takeIf { it.isNotBlank() }
+                            ?: if (errorText.contains("занят", ignoreCase = true)) {
+                                "Подождите, агент занят. Повторите через минуту."
+                            } else {
+                                "Не удалось выполнить запрос. Подробности в чате."
+                            }
                     speakErrorMessage(speechErrorText)
                 } else {
                     appPreferences.lastAssistantText = turnResult.assistantText
@@ -129,7 +133,13 @@ class VoiceTurnOrchestrator(
             } catch (runError: Exception) {
                 val message = runError.message ?: runError.toString()
                 stateListener.onLogLine("Сбой: $message")
-                speakErrorMessage(message)
+                val briefSpeech =
+                    if (message.contains("занят", ignoreCase = true)) {
+                        "Подождите, агент занят. Повторите через минуту."
+                    } else {
+                        "Не удалось выполнить запрос. Подробности в чате."
+                    }
+                speakErrorMessage(briefSpeech)
             } finally {
                 isTurnInProgress = false
                 if (mediaPlayer == null) {
@@ -144,9 +154,9 @@ class VoiceTurnOrchestrator(
         onTurnFullyFinished?.invoke()
     }
 
-    private fun speakErrorMessage(errorMessage: String) {
+    private fun speakErrorMessage(briefSpeechText: String) {
         try {
-            playAssistantSpeech("Ошибка. $errorMessage")
+            playAssistantSpeech(briefSpeechText)
         } catch (_: Exception) {
             stateListener.onStateChanged(VoiceClientState.IDLE, "Готов")
         }
