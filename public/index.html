@@ -117,7 +117,8 @@
         gap: 0.4rem;
         align-items: center;
       }
-      #workspace-select {
+      #workspace-select,
+      #model-select {
         font: inherit;
         font-size: 0.8rem;
         padding: 0.35rem 0.5rem;
@@ -338,6 +339,7 @@
       </div>
       <h1>Cursor Agent</h1>
       <select id="workspace-select" title="Рабочая папка агента (репозиторий)"></select>
+      <select id="model-select" title="Модель Cursor для ответов"></select>
       <span id="status-pill">готов</span>
       <div class="toolbar">
         <button type="button" id="attach-btn" title="Прикрепить файл">📎</button>
@@ -371,6 +373,7 @@
     <script>
       const SESSION_STORAGE_KEY = "cursor_sdk_chat_session_id";
       const WORKSPACE_STORAGE_KEY = "cursor_sdk_chat_workspace_id";
+      const MODEL_STORAGE_KEY = "cursor_sdk_chat_model_id";
       const HISTORY_STORAGE_KEY = "cursor_sdk_chat_history_v1";
 
       const messagesElement = document.getElementById("messages");
@@ -383,12 +386,14 @@
       const attachInputElement = document.getElementById("attach-input");
       const attachListElement = document.getElementById("attach-list");
       const workspaceSelectElement = document.getElementById("workspace-select");
+      const modelSelectElement = document.getElementById("model-select");
       const statusPillElement = document.getElementById("status-pill");
       const vpnIndicatorElement = document.getElementById("vpn-indicator");
       const voiceRecordButton = document.getElementById("voice-record");
 
       let chatSessionId = localStorage.getItem(SESSION_STORAGE_KEY) || "";
       let selectedWorkspaceId = localStorage.getItem(WORKSPACE_STORAGE_KEY) || "";
+      let selectedModelId = localStorage.getItem(MODEL_STORAGE_KEY) || "";
       let uploadMaxBytes = 3 * 1024 * 1024;
       let isRequestInFlight = false;
       let currentAgentBubbleElement = null;
@@ -415,6 +420,15 @@
       function persistWorkspaceId(workspaceId) {
         selectedWorkspaceId = workspaceId;
         localStorage.setItem(WORKSPACE_STORAGE_KEY, workspaceId);
+      }
+
+      function persistModelId(modelId) {
+        selectedModelId = modelId;
+        localStorage.setItem(MODEL_STORAGE_KEY, modelId);
+      }
+
+      function getSelectedModelId() {
+        return modelSelectElement.value || selectedModelId || "";
       }
 
       const ALICE_SKILL_RESPONSE_LIMIT_MS = 4500;
@@ -1068,6 +1082,7 @@
         attachButton.disabled = !enabled;
         inputElement.disabled = !enabled;
         workspaceSelectElement.disabled = !enabled || isRequestInFlight;
+        modelSelectElement.disabled = !enabled || isRequestInFlight;
         if (voiceEnabled) {
           voiceRecordButton.disabled = !enabled;
         }
@@ -1094,6 +1109,26 @@
         if (selectedWorkspaceId) {
           workspaceSelectElement.value = selectedWorkspaceId;
         }
+        modelSelectElement.innerHTML = "";
+        for (const modelOption of config.models || []) {
+          const option = document.createElement("option");
+          option.value = modelOption.id;
+          option.textContent = modelOption.label || modelOption.id;
+          modelSelectElement.appendChild(option);
+        }
+        if (!selectedModelId && config.defaultModelId) {
+          selectedModelId = config.defaultModelId;
+        }
+        if (selectedModelId) {
+          const modelStillAllowed = (config.models || []).some(
+            (modelOption) => modelOption.id === selectedModelId,
+          );
+          if (!modelStillAllowed && config.defaultModelId) {
+            selectedModelId = config.defaultModelId;
+            persistModelId(selectedModelId);
+          }
+          modelSelectElement.value = selectedModelId;
+        }
         if (config.vpnHealth && config.vpnHealth.pollIntervalMs) {
           vpnHealthPollIntervalMs = config.vpnHealth.pollIntervalMs;
         }
@@ -1110,6 +1145,14 @@
       workspaceSelectElement.addEventListener("change", () => {
         persistWorkspaceId(workspaceSelectElement.value);
         appendSystemNote("Репозиторий: " + workspaceSelectElement.value);
+      });
+
+      modelSelectElement.addEventListener("change", () => {
+        persistModelId(modelSelectElement.value);
+        const selectedLabel =
+          modelSelectElement.options[modelSelectElement.selectedIndex]?.textContent ||
+          modelSelectElement.value;
+        appendSystemNote("Модель: " + selectedLabel);
       });
 
       attachButton.addEventListener("click", () => {
@@ -1247,6 +1290,7 @@
             message: messageText,
             sessionId: chatSessionId || undefined,
             workspaceId: workspaceSelectElement.value || selectedWorkspaceId,
+            modelId: getSelectedModelId(),
             attachments: attachmentSnapshot,
             responseMode: chatResponseMode,
           }),
@@ -1260,6 +1304,11 @@
         if (responseWorkspaceHeader) {
           persistWorkspaceId(responseWorkspaceHeader);
           workspaceSelectElement.value = responseWorkspaceHeader;
+        }
+        const responseModelHeader = fetchResponse.headers.get("X-Chat-Model-Id");
+        if (responseModelHeader) {
+          persistModelId(responseModelHeader);
+          modelSelectElement.value = responseModelHeader;
         }
 
         if (!fetchResponse.ok) {
@@ -1285,6 +1334,10 @@
           }
           if (event.kind === "session" && event.workspaceId) {
             persistWorkspaceId(event.workspaceId);
+          }
+          if (event.kind === "session" && event.modelId) {
+            persistModelId(event.modelId);
+            modelSelectElement.value = event.modelId;
           } else if (event.kind === "assistant_text") {
             const agentBubble = ensureAgentBubble();
             const agentTextElement = getAgentBubbleTextElement(agentBubble);

@@ -14,6 +14,7 @@ interface VoiceTurnRequestBody {
   sessionId?: string;
   workspaceId?: string;
   responseMode?: string;
+  modelId?: string;
 }
 
 export interface ChatMessageRunResult {
@@ -32,14 +33,23 @@ export interface VoiceTurnRouteHost {
   ) => Promise<string | SDKUserMessage>;
   isSessionBusy: (sessionId: string) => boolean;
   isWorkspaceBusy: (workspaceId: string) => boolean;
-  acquireChatTurnLocks: (sessionId: string, workspaceId: string) => Promise<void>;
+  acquireChatTurnLocks: (
+    sessionId: string,
+    workspaceId: string,
+    modelId: string,
+  ) => Promise<void>;
   releaseChatTurnLocks: (sessionId: string, workspaceId: string) => void;
+  resolveModelId: (
+    response: express.Response,
+    rawModelId: unknown,
+  ) => string | undefined;
   runChatTurnWithRetry: (
     workspace: WorkspaceEntry,
     sessionId: string,
     userMessagePayload: string | SDKUserMessage,
     userMessageText: string,
     responseMode: ChatResponseMode,
+    modelId: string,
   ) => Promise<ChatMessageRunResult>;
   recoverWorkspaceAfterFailure: (
     workspaceId: string,
@@ -63,6 +73,10 @@ export function registerVoiceTurnRoute(
     const sessionId = host.normalizeSessionId(requestBody.sessionId);
     const workspace = host.resolveWorkspace(requestBody.workspaceId);
     const responseMode = parseChatResponseMode(requestBody.responseMode ?? "voice");
+    const resolvedModelId = host.resolveModelId(response, requestBody.modelId);
+    if (!resolvedModelId) {
+      return;
+    }
 
     let userMessageText =
       typeof requestBody.message === "string" ? requestBody.message.trim() : "";
@@ -171,7 +185,7 @@ export function registerVoiceTurnRoute(
     }
 
     try {
-      await host.acquireChatTurnLocks(sessionId, workspace.id);
+      await host.acquireChatTurnLocks(sessionId, workspace.id, resolvedModelId);
     } catch (lockError) {
       response.status(503).json({
         ok: false,
@@ -187,6 +201,7 @@ export function registerVoiceTurnRoute(
         userMessagePayload,
         userMessageText,
         responseMode,
+        resolvedModelId,
       );
 
       const durationMs = Date.now() - turnStartedAtMs;
@@ -196,6 +211,7 @@ export function registerVoiceTurnRoute(
         ok: runStatus !== "error" && runStatus !== "cancelled",
         sessionId,
         workspaceId: workspace.id,
+        modelId: resolvedModelId,
         userText: userMessageText,
         assistantText: chatResult.assistantText,
         durationMs,

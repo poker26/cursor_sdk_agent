@@ -8,6 +8,7 @@ const workspaceStateFilePath = path.join(dataDirectoryPath, "workspace-state.jso
 
 export interface WorkspacePersistedState {
   agentId: string;
+  modelId?: string;
   updatedAt: string;
 }
 
@@ -49,16 +50,30 @@ export async function loadPersistedAgentId(workspaceId: string): Promise<string 
   return stateFile.workspaces[workspaceId]?.agentId;
 }
 
+export async function loadPersistedModelId(
+  workspaceId: string,
+): Promise<string | undefined> {
+  if (!isPersistAgentIdEnabled()) {
+    return undefined;
+  }
+  const stateFile = await readWorkspaceStateFile();
+  const modelId = stateFile.workspaces[workspaceId]?.modelId;
+  return typeof modelId === "string" && modelId.trim() ? modelId.trim() : undefined;
+}
+
 export async function savePersistedAgentId(
   workspaceId: string,
   agentId: string,
+  modelId?: string,
 ): Promise<void> {
   if (!isPersistAgentIdEnabled()) {
     return;
   }
   const stateFile = await readWorkspaceStateFile();
+  const previous = stateFile.workspaces[workspaceId];
   stateFile.workspaces[workspaceId] = {
     agentId,
+    modelId: modelId?.trim() || previous?.modelId,
     updatedAt: new Date().toISOString(),
   };
   await writeWorkspaceStateFile(stateFile);

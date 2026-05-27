@@ -31,8 +31,15 @@ import { clearWorkspaceBrain } from "./brain/supabase-brain.js";
 import { deleteQdrantCollection } from "./brain/qdrant-brain.js";
 import { clearMemoryFile } from "./memory.js";
 import {
+  getDefaultAgentModelId,
+  InvalidAgentModelIdError,
+  listAgentModelOptions,
+  resolveRequestedAgentModelId,
+} from "./agent-model.js";
+import {
   clearPersistedAgentId,
   loadPersistedAgentId,
+  loadPersistedModelId,
   savePersistedAgentId,
 } from "./workspace-state.js";
 import {
@@ -80,6 +87,7 @@ interface ClientAttachmentPayload {
 interface WorkspaceAgentRecord {
   agent: SDKAgent;
   workspaceId: string;
+  modelId: string;
   busy: boolean;
   lastActivityAt: number;
   idleDisposeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -365,9 +373,26 @@ function listConfiguredMcpServersForDiagnostics(): Array<{ id: string; transport
   });
 }
 
-async function createChatAgent(workspace: WorkspaceEntry): Promise<SDKAgent> {
+function resolveModelIdForRequest(
+  response: express.Response,
+  rawModelId: unknown,
+): string | undefined {
+  try {
+    return resolveRequestedAgentModelId(rawModelId);
+  } catch (modelError) {
+    if (modelError instanceof InvalidAgentModelIdError) {
+      response.status(400).json({ error: modelError.message });
+      return undefined;
+    }
+    throw modelError;
+  }
+}
+
+async function createChatAgent(
+  workspace: WorkspaceEntry,
+  modelId: string,
+): Promise<SDKAgent> {
   const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
-  const modelId = process.env.CURSOR_MODEL_ID?.trim() || "composer-2";
   const mcpServers = buildMcpServersConfiguration();
   const mcpServerIds = mcpServers ? Object.keys(mcpServers) : [];
   if (mcpServerIds.length > 0) {
@@ -387,12 +412,26 @@ async function createChatAgent(workspace: WorkspaceEntry): Promise<SDKAgent> {
   });
 }
 
-async function resumeOrCreateWorkspaceAgent(workspace: WorkspaceEntry): Promise<SDKAgent> {
+async function resumeOrCreateWorkspaceAgent(
+  workspace: WorkspaceEntry,
+  modelId: string,
+): Promise<SDKAgent> {
   const persistedAgentId = await loadPersistedAgentId(workspace.id);
-  if (persistedAgentId) {
+  const persistedModelId = await loadPersistedModelId(workspace.id);
+  const canResumePersistedAgent =
+    Boolean(persistedAgentId) &&
+    (!persistedModelId || persistedModelId === modelId);
+
+  if (persistedAgentId && !canResumePersistedAgent) {
+    logServerMessage(
+      `workspace ${workspace.id} skip resume: model ${persistedModelId ?? "?"} → ${modelId}`,
+    );
+    await clearPersistedAgentId(workspace.id);
+  }
+
+  if (persistedAgentId && canResumePersistedAgent) {
     try {
       const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
-      const modelId = process.env.CURSOR_MODEL_ID?.trim() || "composer-2";
       const mcpServers = buildMcpServersConfiguration();
       const agent = await Agent.resume(persistedAgentId, {
         apiKey,
@@ -404,7 +443,7 @@ async function resumeOrCreateWorkspaceAgent(workspace: WorkspaceEntry): Promise<
         ...(mcpServers ? { mcpServers } : {}),
       });
       logServerMessage(
-        `workspace ${workspace.id} resumed agent ${agent.agentId}`,
+        `workspace ${workspace.id} resumed agent ${agent.agentId} (model ${modelId})`,
       );
       return agent;
     } catch (resumeError) {
@@ -414,7 +453,7 @@ async function resumeOrCreateWorkspaceAgent(workspace: WorkspaceEntry): Promise<
       await clearPersistedAgentId(workspace.id);
     }
   }
-  return createChatAgent(workspace);
+  return createChatAgent(workspace, modelId);
 }
 
 async function buildUserMessagePayload(
@@ -518,27 +557,34 @@ async function disposeWorkspaceAgent(workspaceId: string, reason: string): Promi
 
 async function getOrCreateWorkspaceAgent(
   workspace: WorkspaceEntry,
+  modelId: string,
 ): Promise<WorkspaceAgentRecord> {
   const existing = workspaceAgents.get(workspace.id);
   if (existing) {
-    touchWorkspaceActivity(existing);
-    clearWorkspaceIdleTimer(existing);
-    return existing;
+    if (existing.modelId !== modelId) {
+      await disposeWorkspaceAgent(workspace.id, `model ${existing.modelId} → ${modelId}`);
+      await clearPersistedAgentId(workspace.id);
+    } else {
+      touchWorkspaceActivity(existing);
+      clearWorkspaceIdleTimer(existing);
+      return existing;
+    }
   }
 
-  const agent = await resumeOrCreateWorkspaceAgent(workspace);
-  await savePersistedAgentId(workspace.id, agent.agentId);
+  const agent = await resumeOrCreateWorkspaceAgent(workspace, modelId);
+  await savePersistedAgentId(workspace.id, agent.agentId, modelId);
 
   const workspaceRecord: WorkspaceAgentRecord = {
     agent,
     workspaceId: workspace.id,
+    modelId,
     busy: false,
     lastActivityAt: Date.now(),
     idleDisposeTimer: undefined,
   };
   workspaceAgents.set(workspace.id, workspaceRecord);
   logServerMessage(
-    `workspace ${workspace.id} agent ready (${agent.agentId})`,
+    `workspace ${workspace.id} agent ready (${agent.agentId}, model ${modelId})`,
   );
   return workspaceRecord;
 }
@@ -702,6 +748,7 @@ async function executeChatMessageCore(
     forceLocalRun: boolean;
     recreateWorkspaceAgent: boolean;
     responseMode: ChatResponseMode;
+    modelId: string;
   },
 ): Promise<ChatMessageRunResult> {
   if (options.recreateWorkspaceAgent) {
@@ -709,7 +756,7 @@ async function executeChatMessageCore(
     await clearPersistedAgentId(workspace.id);
   }
 
-  const workspaceRecord = await getOrCreateWorkspaceAgent(workspace);
+  const workspaceRecord = await getOrCreateWorkspaceAgent(workspace, options.modelId);
   const dateTimePrefix = buildCurrentDateTimeContextPrefix();
   const stylePrefix = buildChatResponseStylePrefix(options.responseMode);
   const brainPrefix = await buildBrainContextPrefix({
@@ -790,6 +837,7 @@ async function executeChatMessageForWorkspace(
     forceLocalRun: boolean;
     recreateWorkspaceAgent: boolean;
     responseMode: ChatResponseMode;
+    modelId: string;
   },
 ): Promise<void> {
   await executeChatMessageCore(
@@ -823,6 +871,7 @@ async function runChatTurnWithRetry(
   userMessagePayload: string | SDKUserMessage,
   userMessageText: string,
   responseMode: ChatResponseMode,
+  modelId: string,
   streamSink: {
     shouldContinue: () => boolean;
     writeClientEvent?: (payload: Record<string, unknown>) => void;
@@ -834,7 +883,7 @@ async function runChatTurnWithRetry(
       userMessagePayload,
       userMessageText,
       streamSink,
-      { forceLocalRun: false, recreateWorkspaceAgent: false, responseMode },
+      { forceLocalRun: false, recreateWorkspaceAgent: false, responseMode, modelId },
     );
   } catch (firstAttemptError) {
     const normalizedError = normalizeThrownError(firstAttemptError);
@@ -868,6 +917,7 @@ async function runChatTurnWithRetry(
         forceLocalRun: shouldForceLocalRun || shouldRecreateWorkspaceAgent,
         recreateWorkspaceAgent: shouldRecreateWorkspaceAgent,
         responseMode,
+        modelId,
       },
     );
   }
@@ -905,7 +955,8 @@ application.get("/api/config", (_request, response) => {
     mcpServers: configuredMcpServers,
     mcpServerIds: configuredMcpServers.map((entry) => entry.id),
     uploadMaxBytes: UPLOAD_MAX_BYTES,
-    modelId: process.env.CURSOR_MODEL_ID?.trim() || "composer-2",
+    defaultModelId: getDefaultAgentModelId(),
+    models: listAgentModelOptions(),
     vpnHealth: {
       healthUrl: getVpnHealthUrl(),
       pollIntervalMs: getVpnHealthPollIntervalMs(),
@@ -929,19 +980,34 @@ registerVoiceTurnRoute(application, {
   buildUserMessagePayload,
   isSessionBusy: (sessionId) => sessionLocks.get(sessionId)?.busy === true,
   isWorkspaceBusy: (workspaceId) => workspaceAgents.get(workspaceId)?.busy === true,
-  acquireChatTurnLocks: async (sessionId, workspaceId) => {
+  acquireChatTurnLocks: async (sessionId, workspaceId, modelId) => {
     const workspaceForLock = resolveWorkspace(workspaceId);
     sessionLocks.set(sessionId, { busy: true, workspaceId: workspaceForLock.id });
-    const ensuredWorkspace = await getOrCreateWorkspaceAgent(workspaceForLock);
+    const ensuredWorkspace = await getOrCreateWorkspaceAgent(workspaceForLock, modelId);
     ensuredWorkspace.busy = true;
     touchWorkspaceActivity(ensuredWorkspace);
     clearWorkspaceIdleTimer(ensuredWorkspace);
   },
   releaseChatTurnLocks,
-  runChatTurnWithRetry: (workspace, sessionId, userMessagePayload, userMessageText, responseMode) =>
-    runChatTurnWithRetry(workspace, sessionId, userMessagePayload, userMessageText, responseMode, {
-      shouldContinue: () => true,
-    }),
+  runChatTurnWithRetry: (
+    workspace,
+    sessionId,
+    userMessagePayload,
+    userMessageText,
+    responseMode,
+    modelId,
+  ) =>
+    runChatTurnWithRetry(
+      workspace,
+      sessionId,
+      userMessagePayload,
+      userMessageText,
+      responseMode,
+      modelId,
+      {
+        shouldContinue: () => true,
+      },
+    ),
   recoverWorkspaceAfterFailure: async (workspaceId, reason, error) => {
     if (isAuthenticationFailure(error)) {
       await recoverStuckWorkspaceAgent(workspaceId, reason);
@@ -949,6 +1015,7 @@ registerVoiceTurnRoute(application, {
       await recoverStuckWorkspaceAgent(workspaceId, reason);
     }
   },
+  resolveModelId: resolveModelIdForRequest,
 });
 
 application.get("/api/vpn-health", async (_request, response) => {
@@ -962,6 +1029,10 @@ application.post("/api/chat", async (request, response) => {
   const userMessageText = typeof request.body?.message === "string" ? request.body.message : "";
   const responseMode = parseChatResponseMode(request.body?.responseMode);
   const attachments = parseClientAttachments(request.body?.attachments);
+  const resolvedModelId = resolveModelIdForRequest(response, request.body?.modelId);
+  if (!resolvedModelId) {
+    return;
+  }
 
   if (!userMessageText.trim() && attachments.length === 0) {
     response.status(400).json({ error: "Нужен текст сообщения и/или вложения." });
@@ -1002,7 +1073,7 @@ application.post("/api/chat", async (request, response) => {
   }
 
   sessionLocks.set(sessionId, { busy: true, workspaceId: workspace.id });
-  const ensuredWorkspace = await getOrCreateWorkspaceAgent(workspace);
+  const ensuredWorkspace = await getOrCreateWorkspaceAgent(workspace, resolvedModelId);
   ensuredWorkspace.busy = true;
   touchWorkspaceActivity(ensuredWorkspace);
   clearWorkspaceIdleTimer(ensuredWorkspace);
@@ -1012,9 +1083,15 @@ application.post("/api/chat", async (request, response) => {
   response.setHeader("Connection", "keep-alive");
   response.setHeader("X-Chat-Session-Id", sessionId);
   response.setHeader("X-Chat-Workspace-Id", workspace.id);
+  response.setHeader("X-Chat-Model-Id", resolvedModelId);
   response.flushHeaders?.();
 
-  writeSseDataLine(response, { kind: "session", sessionId, workspaceId: workspace.id });
+  writeSseDataLine(response, {
+    kind: "session",
+    sessionId,
+    workspaceId: workspace.id,
+    modelId: resolvedModelId,
+  });
 
   let clientStillConnected = true;
   request.on("close", () => {
@@ -1032,7 +1109,12 @@ application.post("/api/chat", async (request, response) => {
         userMessageText,
         response,
         isClientStillConnected,
-        { forceLocalRun: false, recreateWorkspaceAgent: false, responseMode },
+        {
+          forceLocalRun: false,
+          recreateWorkspaceAgent: false,
+          responseMode,
+          modelId: resolvedModelId,
+        },
       );
     } catch (firstAttemptError) {
       const normalizedError = normalizeThrownError(firstAttemptError);
@@ -1071,6 +1153,7 @@ application.post("/api/chat", async (request, response) => {
           forceLocalRun: shouldForceLocalRun || shouldRecreateWorkspaceAgent,
           recreateWorkspaceAgent: shouldRecreateWorkspaceAgent,
           responseMode,
+          modelId: resolvedModelId,
         },
       );
     }
