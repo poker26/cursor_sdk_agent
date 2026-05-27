@@ -62,6 +62,10 @@ import {
 } from "./chat-response-style.js";
 import { sanitizeAssistantResponseForChat } from "./assistant-response-sanitize.js";
 import { buildCurrentDateTimeContextPrefix } from "./current-datetime-context.js";
+import {
+  RunDiagnosticsCollector,
+  resolveRunErrorDetailText,
+} from "./run-diagnostics.js";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
@@ -641,6 +645,8 @@ async function runAgentStreamToCompletion(
   agentRun: Run,
   streamOptions: AgentRunStreamOptions,
 ): Promise<{ status: string; result?: string; runId: string }> {
+  const runDiagnosticsCollector = new RunDiagnosticsCollector();
+
   for await (const streamMessage of agentRun.stream()) {
     if (!streamOptions.shouldContinue()) {
       if (agentRun.supports("cancel")) {
@@ -660,6 +666,7 @@ async function runAgentStreamToCompletion(
         streamOptions.onAssistantText(textDelta);
       }
     }
+    runDiagnosticsCollector.observeStreamMessage(streamMessage);
     const clientPayload = describeStreamMessageForClient(streamMessage);
     if (clientPayload && streamOptions.writeClientEvent) {
       streamOptions.writeClientEvent(clientPayload);
@@ -671,22 +678,28 @@ async function runAgentStreamToCompletion(
   }
 
   const terminalResult = await agentRun.wait();
+  let resolvedResultText = terminalResult.result;
   if (terminalResult.status === "error") {
+    resolvedResultText = await resolveRunErrorDetailText(
+      agentRun,
+      terminalResult,
+      runDiagnosticsCollector,
+    );
     logServerMessage(
-      `run ${agentRun.id} finished with error: ${terminalResult.result ?? "(no result text)"}`,
+      `run ${agentRun.id} finished with error:\n${resolvedResultText}`,
     );
   }
   if (streamOptions.writeClientEvent) {
     streamOptions.writeClientEvent({
       kind: "run_finished",
       status: terminalResult.status,
-      result: terminalResult.result,
+      result: resolvedResultText,
       runId: agentRun.id,
     });
   }
   return {
     status: terminalResult.status,
-    result: terminalResult.result,
+    result: resolvedResultText,
     runId: agentRun.id,
   };
 }
