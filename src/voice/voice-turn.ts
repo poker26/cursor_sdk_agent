@@ -220,7 +220,6 @@ export function registerVoiceTurnRoute(
           workspaceId: workspace.id,
           modelId: resolvedModelId,
           userText: userMessageText,
-          assistantText: errorPayload.assistantText,
           durationMs,
           status: runStatus,
           runId: chatResult.runOutcome.runId,
