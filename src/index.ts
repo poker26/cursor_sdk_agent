@@ -666,7 +666,13 @@ async function runAgentStreamToCompletion(
         streamOptions.onAssistantText(textDelta);
       }
     }
-    runDiagnosticsCollector.observeStreamMessage(streamMessage);
+    try {
+      runDiagnosticsCollector.observeStreamMessage(streamMessage);
+    } catch (diagnosticsObserveError) {
+      logServerMessage(
+        `run diagnostics observe skipped: ${diagnosticsObserveError instanceof Error ? diagnosticsObserveError.message : String(diagnosticsObserveError)}`,
+      );
+    }
     const clientPayload = describeStreamMessageForClient(streamMessage);
     if (clientPayload && streamOptions.writeClientEvent) {
       streamOptions.writeClientEvent(clientPayload);
@@ -677,7 +683,33 @@ async function runAgentStreamToCompletion(
     return { status: "cancelled", runId: agentRun.id };
   }
 
-  const terminalResult = await agentRun.wait();
+  let terminalResult: Awaited<ReturnType<Run["wait"]>>;
+  try {
+    terminalResult = await agentRun.wait();
+  } catch (waitError) {
+    const waitErrorMessage =
+      waitError instanceof Error ? waitError.message : String(waitError);
+    logServerMessage(`run ${agentRun.id} wait() failed: ${waitErrorMessage}`);
+    const fallbackResult = await resolveRunErrorDetailText(
+      agentRun,
+      {
+        id: agentRun.id,
+        status: "error",
+        result: waitErrorMessage,
+      },
+      runDiagnosticsCollector,
+    );
+    if (streamOptions.writeClientEvent) {
+      streamOptions.writeClientEvent({
+        kind: "run_finished",
+        status: "error",
+        result: fallbackResult,
+        runId: agentRun.id,
+      });
+    }
+    return { status: "error", result: fallbackResult, runId: agentRun.id };
+  }
+
   let resolvedResultText = terminalResult.result;
   if (terminalResult.status === "error") {
     resolvedResultText = await resolveRunErrorDetailText(

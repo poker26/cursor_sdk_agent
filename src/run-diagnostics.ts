@@ -4,6 +4,11 @@ import type { SDKMessage, SDKToolUseMessage } from "@cursor/sdk";
 const MAX_DIAGNOSTIC_EVENTS = 24;
 const MAX_SNIPPET_CHARS = 900;
 
+function isConversationDiagnosticsEnabled(): boolean {
+  const rawValue = process.env.RUN_DIAGNOSTICS_USE_CONVERSATION?.trim().toLowerCase();
+  return rawValue === "true" || rawValue === "1";
+}
+
 export interface RunDiagnosticEvent {
   kind: string;
   summary: string;
@@ -14,6 +19,14 @@ export class RunDiagnosticsCollector {
   private readonly recentCompletedToolNames: string[] = [];
 
   observeStreamMessage(streamMessage: SDKMessage): void {
+    try {
+      this.observeStreamMessageCore(streamMessage);
+    } catch {
+      /* не прерываем run из-за диагностики */
+    }
+  }
+
+  private observeStreamMessageCore(streamMessage: SDKMessage): void {
     if (streamMessage.type === "status") {
       const statusValue = streamMessage.status;
       if (
@@ -48,16 +61,17 @@ export class RunDiagnosticsCollector {
     }
 
     if (streamMessage.type === "task") {
-      const taskStatus = streamMessage.status?.trim();
+      const taskStatus = streamMessage.status?.trim().toLowerCase();
       const taskText = streamMessage.text?.trim();
-      if (
-        taskStatus?.toLowerCase().includes("error") ||
-        taskStatus?.toLowerCase().includes("fail") ||
-        taskText
-      ) {
+      const taskLooksLikeFailure =
+        Boolean(taskStatus) &&
+        (taskStatus.includes("error") ||
+          taskStatus.includes("fail") ||
+          taskStatus.includes("cancel"));
+      if (taskLooksLikeFailure) {
         this.pushDiagnosticEvent(
           "task",
-          [taskStatus, taskText].filter(Boolean).join(": "),
+          [streamMessage.status, taskText].filter(Boolean).join(": "),
         );
       }
     }
@@ -103,47 +117,61 @@ export async function resolveRunErrorDetailText(
   terminalResult: RunResult,
   diagnosticsCollector: RunDiagnosticsCollector,
 ): Promise<string> {
-  const primaryCandidates = [
-    terminalResult.result,
-    agentRun.result,
-  ];
-  for (const candidate of primaryCandidates) {
-    const trimmed = candidate?.trim();
-    if (trimmed) {
-      return trimmed;
+  try {
+    const primaryCandidates = [terminalResult.result, agentRun.result];
+    for (const candidate of primaryCandidates) {
+      const trimmed = candidate?.trim();
+      if (trimmed) {
+        return trimmed;
+      }
     }
-  }
 
-  const fromConversation = await tryExtractErrorDetailFromConversation(agentRun);
-  if (fromConversation) {
-    return fromConversation;
-  }
+    if (isConversationDiagnosticsEnabled()) {
+      const fromConversation = await tryExtractErrorDetailFromConversation(agentRun);
+      if (fromConversation) {
+        return fromConversation;
+      }
+    }
 
-  const fromStreamDiagnostics = diagnosticsCollector.formatCollectedDiagnostics();
-  if (fromStreamDiagnostics) {
-    return [
-      "SDK не вернул текст ошибки (result пустой). По событиям run:",
-      fromStreamDiagnostics,
-    ].join("\n");
-  }
+    const fromStreamDiagnostics = diagnosticsCollector.formatCollectedDiagnostics();
+    if (fromStreamDiagnostics) {
+      return [
+        "SDK не вернул текст ошибки (result пустой). По событиям run:",
+        fromStreamDiagnostics,
+      ].join("\n");
+    }
 
-  const durationHint =
-    terminalResult.durationMs !== undefined
-      ? `Длительность run: ${terminalResult.durationMs} мс.`
+    const durationHint =
+      terminalResult.durationMs !== undefined
+        ? `Длительность run: ${terminalResult.durationMs} мс.`
+        : undefined;
+    const modelHint = terminalResult.model?.id
+      ? `Модель: ${terminalResult.model.id}.`
       : undefined;
-  const modelHint = terminalResult.model?.id
-    ? `Модель: ${terminalResult.model.id}.`
-    : undefined;
 
-  return [
-    "Run завершился со статусом error, но Cursor SDK не передал result и в потоке нет явной ошибки инструмента.",
-    "Частые причины: сбой локального агента, таймаут, обрыв MCP, нехватка памяти на VDS.",
-    durationHint,
-    modelHint,
-    `runId: ${terminalResult.id || agentRun.id}`,
-  ]
-    .filter((line): line is string => Boolean(line?.trim()))
-    .join("\n");
+    return [
+      "Run завершился со статусом error, но Cursor SDK не передал result и в потоке нет явной ошибки инструмента.",
+      "Частые причины: сбой локального агента, таймаут, обрыв MCP, нехватка памяти на VDS.",
+      durationHint,
+      modelHint,
+      `runId: ${terminalResult.id || agentRun.id}`,
+    ]
+      .filter((line): line is string => Boolean(line?.trim()))
+      .join("\n");
+  } catch (diagnosticsError) {
+    const diagnosticsMessage =
+      diagnosticsError instanceof Error
+        ? diagnosticsError.message
+        : String(diagnosticsError);
+    return [
+      terminalResult.result?.trim(),
+      agentRun.result?.trim(),
+      `runId: ${terminalResult.id || agentRun.id}`,
+      `Не удалось собрать диагностику: ${diagnosticsMessage}`,
+    ]
+      .filter((line): line is string => Boolean(line?.trim()))
+      .join("\n");
+  }
 }
 
 async function tryExtractErrorDetailFromConversation(
