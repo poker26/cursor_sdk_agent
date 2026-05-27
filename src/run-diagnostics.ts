@@ -61,13 +61,13 @@ export class RunDiagnosticsCollector {
     }
 
     if (streamMessage.type === "task") {
-      const taskStatus = streamMessage.status?.trim().toLowerCase();
+      const taskStatusNormalized = streamMessage.status?.trim().toLowerCase() ?? "";
       const taskText = streamMessage.text?.trim();
       const taskLooksLikeFailure =
-        Boolean(taskStatus) &&
-        (taskStatus.includes("error") ||
-          taskStatus.includes("fail") ||
-          taskStatus.includes("cancel"));
+        taskStatusNormalized.length > 0 &&
+        (taskStatusNormalized.includes("error") ||
+          taskStatusNormalized.includes("fail") ||
+          taskStatusNormalized.includes("cancel"));
       if (taskLooksLikeFailure) {
         this.pushDiagnosticEvent(
           "task",
