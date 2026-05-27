@@ -671,6 +671,11 @@ async function runAgentStreamToCompletion(
   }
 
   const terminalResult = await agentRun.wait();
+  if (terminalResult.status === "error") {
+    logServerMessage(
+      `run ${agentRun.id} finished with error: ${terminalResult.result ?? "(no result text)"}`,
+    );
+  }
   if (streamOptions.writeClientEvent) {
     streamOptions.writeClientEvent({
       kind: "run_finished",
