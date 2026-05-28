@@ -56,10 +56,6 @@
         color: var(--error);
         border-color: #6e3030;
       }
-      #status-pill.slow-response {
-        color: #f0c674;
-        border-color: #8b6914;
-      }
       #vpn-indicator {
         display: flex;
         align-items: center;
@@ -179,9 +175,6 @@
         color: var(--muted);
         letter-spacing: 0.02em;
       }
-      .msg.agent .response-timing.slow {
-        color: #f0c674;
-      }
       .msg.system {
         align-self: center;
         font-size: 0.78rem;
@@ -199,6 +192,83 @@
         font-size: 0.75rem;
         color: var(--muted);
         margin-top: 0.35rem;
+      }
+      .agent-activity {
+        flex: 1 1 100%;
+        width: 100%;
+        margin-bottom: 0.5rem;
+        padding: 0.55rem 0.65rem;
+        border-radius: 8px;
+        border: 1px solid #30363d;
+        background: rgba(88, 166, 255, 0.08);
+      }
+      .agent-activity.activity-finished {
+        background: rgba(139, 148, 158, 0.08);
+        border-color: var(--border);
+      }
+      .activity-header {
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+        font-size: 0.8rem;
+        color: #c9d1d9;
+        margin-bottom: 0.35rem;
+      }
+      .activity-spinner {
+        width: 0.85rem;
+        height: 0.85rem;
+        border-radius: 50%;
+        border: 2px solid #30363d;
+        border-top-color: var(--accent);
+        animation: activity-spin 0.85s linear infinite;
+        flex-shrink: 0;
+      }
+      .agent-activity.activity-finished .activity-spinner {
+        display: none;
+      }
+      @keyframes activity-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .activity-status-label {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .activity-elapsed {
+        flex-shrink: 0;
+        font-variant-numeric: tabular-nums;
+        color: var(--muted);
+        font-size: 0.75rem;
+      }
+      .activity-steps {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.2rem;
+        max-height: 9rem;
+        overflow-y: auto;
+      }
+      .activity-step {
+        font-size: 0.74rem;
+        color: var(--muted);
+        padding: 0.12rem 0;
+        line-height: 1.35;
+      }
+      .activity-step.running {
+        color: #e6edf3;
+      }
+      .activity-step.completed {
+        color: #7ee787;
+      }
+      .activity-step.error {
+        color: #ffb4af;
+      }
+      .activity-step.thinking {
+        color: #d2a8ff;
+        font-style: italic;
       }
       .attach-list {
         display: flex;
@@ -257,6 +327,23 @@
         cursor: pointer;
       }
       #send:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      #cancel-chat {
+        flex-shrink: 0;
+        padding: 0.55rem 1rem;
+        border-radius: 8px;
+        border: 1px solid #8b2e2e;
+        background: rgba(248, 81, 73, 0.15);
+        color: #f85149;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #cancel-chat:hover:not(:disabled) {
+        background: rgba(248, 81, 73, 0.28);
+      }
+      #cancel-chat:disabled {
         opacity: 0.45;
         cursor: not-allowed;
       }
@@ -366,6 +453,9 @@
         <div id="composer-side">
           <input type="file" id="attach-input" multiple />
           <button type="button" id="send">Отправить</button>
+          <button type="button" id="cancel-chat" hidden title="Прервать ответ агента">
+            Прервать
+          </button>
         </div>
       </div>
     </footer>
@@ -379,6 +469,7 @@
       const messagesElement = document.getElementById("messages");
       const inputElement = document.getElementById("input");
       const sendButton = document.getElementById("send");
+      const cancelChatButton = document.getElementById("cancel-chat");
       const newChatButton = document.getElementById("new-chat");
       const resetAgentButton = document.getElementById("reset-agent");
       const resetMemoryButton = document.getElementById("reset-memory");
@@ -396,6 +487,21 @@
       let selectedModelId = localStorage.getItem(MODEL_STORAGE_KEY) || "";
       let uploadMaxBytes = 3 * 1024 * 1024;
       let isRequestInFlight = false;
+      let chatAbortController = null;
+      let agentActivityTracking = null;
+
+      const TOOL_DISPLAY_NAME_BY_ID = {
+        Shell: "Терминал",
+        Grep: "Поиск в коде",
+        Read: "Чтение файла",
+        Write: "Запись файла",
+        StrReplace: "Правка файла",
+        Delete: "Удаление файла",
+        Glob: "Поиск файлов",
+        Task: "Подзадача",
+        WebSearch: "Веб-поиск",
+        WebFetch: "Загрузка страницы",
+      };
       let currentAgentBubbleElement = null;
       let pendingAttachments = [];
       let vpnHealthPollIntervalMs = 20000;
@@ -433,8 +539,6 @@
         return modelSelectElement.value || selectedModelId || "";
       }
 
-      const ALICE_SKILL_RESPONSE_LIMIT_MS = 4500;
-
       function formatResponseDurationLabel(responseElapsedMs) {
         const secondsRounded = Math.round((responseElapsedMs / 1000) * 10) / 10;
         return `${secondsRounded} с`;
@@ -443,8 +547,6 @@
       function setStatus(label, mode, responseElapsedMs) {
         const modeClass = mode || "";
         statusPillElement.className = modeClass;
-        statusPillElement.classList.remove("slow-response");
-        statusPillElement.removeAttribute("title");
 
         if (typeof responseElapsedMs !== "number" || responseElapsedMs < 0) {
           statusPillElement.textContent = label;
@@ -453,11 +555,6 @@
 
         const durationLabel = formatResponseDurationLabel(responseElapsedMs);
         statusPillElement.textContent = `${label} · ${durationLabel}`;
-        if (responseElapsedMs > ALICE_SKILL_RESPONSE_LIMIT_MS) {
-          statusPillElement.classList.add("slow-response");
-          statusPillElement.title =
-            "Ответ дольше 4,5 с — для навыка Алисы нужен укороченный или двухшаговый сценарий";
-        }
       }
 
       function applyChatResponseTiming(responseElapsedMs, agentBubbleElement) {
@@ -480,15 +577,7 @@
           targetBubble.appendChild(timingElement);
         }
         const durationLabel = formatResponseDurationLabel(responseElapsedMs);
-        const aliceHint =
-          responseElapsedMs > ALICE_SKILL_RESPONSE_LIMIT_MS
-            ? " · >4,5 с (лимит Алисы)"
-            : "";
-        timingElement.textContent = "⏱ " + durationLabel + aliceHint;
-        timingElement.classList.toggle(
-          "slow",
-          responseElapsedMs > ALICE_SKILL_RESPONSE_LIMIT_MS,
-        );
+        timingElement.textContent = "⏱ " + durationLabel;
       }
 
       function updateVpnIndicator(probePayload) {
@@ -1114,13 +1203,209 @@
         return currentAgentBubbleElement;
       }
 
-      function appendToolHint(text) {
-        const agentBubble = ensureAgentBubble();
-        const hintElement = document.createElement("div");
-        hintElement.className = "tool-hint";
-        hintElement.textContent = text;
-        agentBubble.appendChild(hintElement);
+      function formatToolDisplayName(toolName) {
+        return TOOL_DISPLAY_NAME_BY_ID[toolName] || toolName;
+      }
+
+      function formatServerStatusLabel(statusValue, statusMessage) {
+        if (statusMessage && String(statusMessage).trim()) {
+          return String(statusMessage).trim();
+        }
+        const normalizedStatus = String(statusValue || "").trim().toUpperCase();
+        const statusLabels = {
+          RUNNING: "Агент работает…",
+          IN_PROGRESS: "Выполняется…",
+          PENDING: "Ожидание…",
+          COMPLETED: "Завершено",
+          ERROR: "Ошибка",
+          CANCELLED: "Отменено",
+        };
+        return statusLabels[normalizedStatus] || statusValue || "Агент работает…";
+      }
+
+      function ensureAgentActivityPanel(agentBubble) {
+        let activityPanel = agentBubble.querySelector(".agent-activity");
+        if (activityPanel) {
+          return activityPanel;
+        }
+        activityPanel = document.createElement("div");
+        activityPanel.className = "agent-activity";
+        activityPanel.setAttribute("aria-live", "polite");
+
+        const activityHeader = document.createElement("div");
+        activityHeader.className = "activity-header";
+
+        const activitySpinner = document.createElement("span");
+        activitySpinner.className = "activity-spinner";
+        activitySpinner.setAttribute("aria-hidden", "true");
+
+        const activityStatusLabel = document.createElement("span");
+        activityStatusLabel.className = "activity-status-label";
+        activityStatusLabel.textContent = "Подключение…";
+
+        const activityElapsed = document.createElement("span");
+        activityElapsed.className = "activity-elapsed";
+        activityElapsed.textContent = "0 с";
+
+        activityHeader.appendChild(activitySpinner);
+        activityHeader.appendChild(activityStatusLabel);
+        activityHeader.appendChild(activityElapsed);
+
+        const activitySteps = document.createElement("ul");
+        activitySteps.className = "activity-steps";
+
+        activityPanel.appendChild(activityHeader);
+        activityPanel.appendChild(activitySteps);
+
+        const messageTextElement = agentBubble.querySelector(".msg-text");
+        agentBubble.insertBefore(activityPanel, messageTextElement);
+        return activityPanel;
+      }
+
+      function updateAgentActivityStatus(statusText) {
+        if (!agentActivityTracking) {
+          return;
+        }
+        agentActivityTracking.statusElement.textContent = statusText;
+        if (isRequestInFlight) {
+          setStatus(statusText, "busy");
+        }
+      }
+
+      function updateAgentActivityElapsed() {
+        if (!agentActivityTracking) {
+          return;
+        }
+        const elapsedSeconds = Math.max(
+          0,
+          Math.round((performance.now() - agentActivityTracking.startedAtMs) / 1000),
+        );
+        agentActivityTracking.elapsedElement.textContent = elapsedSeconds + " с";
+      }
+
+      function appendAgentActivityStep(stepKey, stepText, stepState) {
+        if (!agentActivityTracking) {
+          return null;
+        }
+        const stepElement = document.createElement("li");
+        stepElement.className = "activity-step " + (stepState || "");
+        stepElement.textContent = stepText;
+        stepElement.dataset.stepKey = stepKey;
+        agentActivityTracking.stepsElement.appendChild(stepElement);
+        agentActivityTracking.toolRowByKey.set(stepKey, stepElement);
+        while (agentActivityTracking.stepsElement.children.length > 12) {
+          agentActivityTracking.stepsElement.removeChild(
+            agentActivityTracking.stepsElement.firstChild,
+          );
+        }
         scrollMessagesToBottom();
+        return stepElement;
+      }
+
+      function upsertAgentToolStep(toolName, toolStatus) {
+        if (!agentActivityTracking) {
+          return;
+        }
+        const displayName = formatToolDisplayName(toolName);
+        const stepKey = "tool:" + toolName;
+        let stepElement = agentActivityTracking.toolRowByKey.get(stepKey);
+        let stepLabel = displayName;
+        let stepState = "running";
+        if (toolStatus === "running") {
+          stepLabel = "▶ " + displayName + "…";
+          stepState = "running";
+          updateAgentActivityStatus("Инструмент: " + displayName + "…");
+        } else if (toolStatus === "completed") {
+          stepLabel = "✓ " + displayName;
+          stepState = "completed";
+        } else {
+          stepLabel = "✗ " + displayName;
+          stepState = "error";
+        }
+        if (!stepElement) {
+          stepElement = appendAgentActivityStep(stepKey, stepLabel, stepState);
+        } else {
+          stepElement.textContent = stepLabel;
+          stepElement.className = "activity-step " + stepState;
+        }
+      }
+
+      function beginAgentActivityTracking() {
+        const agentBubble = ensureAgentBubble();
+        const activityPanel = ensureAgentActivityPanel(agentBubble);
+        agentActivityTracking = {
+          panelElement: activityPanel,
+          statusElement: activityPanel.querySelector(".activity-status-label"),
+          elapsedElement: activityPanel.querySelector(".activity-elapsed"),
+          stepsElement: activityPanel.querySelector(".activity-steps"),
+          toolRowByKey: new Map(),
+          startedAtMs: performance.now(),
+          timerIntervalId: setInterval(updateAgentActivityElapsed, 1000),
+        };
+        updateAgentActivityStatus("Ожидание ответа…");
+        updateAgentActivityElapsed();
+      }
+
+      function finalizeAgentActivityPanel(runStatus) {
+        if (!agentActivityTracking) {
+          return;
+        }
+        clearInterval(agentActivityTracking.timerIntervalId);
+        agentActivityTracking.panelElement.classList.add("activity-finished");
+        if (runStatus === "cancelled") {
+          updateAgentActivityStatus("Прервано");
+        } else if (runStatus === "error") {
+          updateAgentActivityStatus("Завершено с ошибкой");
+        } else {
+          updateAgentActivityStatus("Готово");
+        }
+        updateAgentActivityElapsed();
+        agentActivityTracking = null;
+      }
+
+      function handleAgentActivitySseEvent(event) {
+        if (!agentActivityTracking) {
+          beginAgentActivityTracking();
+        }
+        if (event.kind === "activity" && event.message) {
+          updateAgentActivityStatus(String(event.message));
+        } else if (event.kind === "heartbeat" && typeof event.elapsedMs === "number") {
+          updateAgentActivityElapsed();
+        } else if (event.kind === "status") {
+          updateAgentActivityStatus(formatServerStatusLabel(event.status, event.message));
+        } else if (event.kind === "thinking") {
+          updateAgentActivityStatus("Думаю…");
+          const thinkingPreview = event.text ? String(event.text).trim() : "";
+          if (thinkingPreview) {
+            const thinkingKey = "thinking";
+            let thinkingStep = agentActivityTracking.toolRowByKey.get(thinkingKey);
+            const thinkingLabel =
+              thinkingPreview.length > 120
+                ? "💭 " + thinkingPreview.slice(0, 120) + "…"
+                : "💭 " + thinkingPreview;
+            if (!thinkingStep) {
+              thinkingStep = appendAgentActivityStep(
+                thinkingKey,
+                thinkingLabel,
+                "thinking",
+              );
+            } else {
+              thinkingStep.textContent = thinkingLabel;
+            }
+          }
+        } else if (event.kind === "task") {
+          const taskLabel =
+            (event.text && String(event.text).trim()) ||
+            (event.status && String(event.status).trim()) ||
+            "Подзадача";
+          const taskKey = "task:" + taskLabel.slice(0, 48);
+          updateAgentActivityStatus(taskLabel);
+          if (!agentActivityTracking.toolRowByKey.has(taskKey)) {
+            appendAgentActivityStep(taskKey, "◎ " + taskLabel, "running");
+          }
+        } else if (event.kind === "tool_call" && event.name) {
+          upsertAgentToolStep(event.name, event.status || "running");
+        }
       }
 
       function renderAttachmentChips() {
@@ -1133,17 +1418,49 @@
         }
       }
 
+      function updateComposerFlightButtons() {
+        const inFlight = isRequestInFlight;
+        sendButton.hidden = inFlight;
+        cancelChatButton.hidden = !inFlight;
+        cancelChatButton.disabled = !inFlight;
+      }
+
       function setComposerEnabled(enabled) {
-        sendButton.disabled = !enabled;
+        sendButton.disabled = !enabled || isRequestInFlight;
         newChatButton.disabled = !enabled;
         resetAgentButton.disabled = !enabled;
         resetMemoryButton.disabled = !enabled;
         attachButton.disabled = !enabled;
-        inputElement.disabled = !enabled;
+        inputElement.disabled = !enabled || isRequestInFlight;
         workspaceSelectElement.disabled = !enabled || isRequestInFlight;
         modelSelectElement.disabled = !enabled || isRequestInFlight;
         if (voiceEnabled) {
-          voiceRecordButton.disabled = !enabled;
+          voiceRecordButton.disabled = !enabled || isRequestInFlight;
+        }
+        updateComposerFlightButtons();
+      }
+
+      async function cancelActiveChatRequest() {
+        if (!isRequestInFlight) {
+          return;
+        }
+        stopSpeechPlayback();
+        const workspaceIdForCancel =
+          workspaceSelectElement.value || selectedWorkspaceId;
+        try {
+          await fetch("/api/chat/cancel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              sessionId: chatSessionId || undefined,
+              workspaceId: workspaceIdForCancel,
+            }),
+          });
+        } catch {
+          /* cancel endpoint is best-effort */
+        }
+        if (chatAbortController) {
+          chatAbortController.abort();
         }
       }
 
@@ -1328,12 +1645,16 @@
 
         stopSpeechPlayback();
         isRequestInFlight = true;
+        chatAbortController = new AbortController();
         currentAgentBubbleElement = null;
+        agentActivityTracking = null;
         setComposerEnabled(false);
+        beginAgentActivityTracking();
         setStatus("думает…", "busy");
         let lastRunSucceeded = false;
         let lastResponseElapsedMs = null;
         let voiceRunErrorDetail = null;
+        let chatWasCancelledByUser = false;
         const responseStartedAtMs = performance.now();
 
         const attachmentSnapshot = pendingAttachments.slice();
@@ -1349,18 +1670,31 @@
         pendingAttachments = [];
         renderAttachmentChips();
 
-        const fetchResponse = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: messageText,
-            sessionId: chatSessionId || undefined,
-            workspaceId: workspaceSelectElement.value || selectedWorkspaceId,
-            modelId: getSelectedModelId(),
-            attachments: attachmentSnapshot,
-            responseMode: chatResponseMode,
-          }),
-        });
+        try {
+        let fetchResponse;
+        try {
+          fetchResponse = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: chatAbortController.signal,
+            body: JSON.stringify({
+              message: messageText,
+              sessionId: chatSessionId || undefined,
+              workspaceId: workspaceSelectElement.value || selectedWorkspaceId,
+              modelId: getSelectedModelId(),
+              attachments: attachmentSnapshot,
+              responseMode: chatResponseMode,
+            }),
+          });
+        } catch (fetchError) {
+          if (fetchError && fetchError.name === "AbortError") {
+            chatWasCancelledByUser = true;
+            appendSystemNote("Запрос прерван.");
+            setStatus("готов", "");
+            return;
+          }
+          throw fetchError;
+        }
 
         const responseSessionHeader = fetchResponse.headers.get("X-Chat-Session-Id");
         if (responseSessionHeader) {
@@ -1389,9 +1723,6 @@
           await reportChatError(errorMessage, performance.now() - responseStartedAtMs, {
             voiceRequest: replyWithSpeechAfterRun,
           });
-          isRequestInFlight = false;
-          currentAgentBubbleElement = null;
-          setComposerEnabled(true);
           return;
         }
 
@@ -1405,8 +1736,20 @@
           if (event.kind === "session" && event.modelId) {
             persistModelId(event.modelId);
             modelSelectElement.value = event.modelId;
+          } else if (
+            event.kind === "activity" ||
+            event.kind === "heartbeat" ||
+            event.kind === "status" ||
+            event.kind === "thinking" ||
+            event.kind === "task" ||
+            event.kind === "tool_call"
+          ) {
+            handleAgentActivitySseEvent(event);
           } else if (event.kind === "assistant_text") {
             const agentBubble = ensureAgentBubble();
+            if (agentActivityTracking) {
+              updateAgentActivityStatus("Пишу ответ…");
+            }
             const agentTextElement = getAgentBubbleTextElement(agentBubble);
             if (agentTextElement) {
               agentTextElement.textContent += event.text;
@@ -1422,21 +1765,18 @@
             }
             scrollMessagesToBottom();
             saveHistoryToStorage();
-          } else if (event.kind === "tool_call") {
-            const label =
-              event.status === "running"
-                ? "▶ " + event.name
-                : event.status === "completed"
-                  ? "✓ " + event.name
-                  : "✗ " + event.name;
-            appendToolHint(label);
           } else if (event.kind === "run_finished") {
-            lastRunSucceeded = event.status !== "error";
+            finalizeAgentActivityPanel(event.status);
+            lastRunSucceeded = event.status !== "error" && event.status !== "cancelled";
             lastResponseElapsedMs = performance.now() - responseStartedAtMs;
             const agentBubbleForTiming =
               currentAgentBubbleElement || findLastAgentMessageBubble();
             applyChatResponseTiming(lastResponseElapsedMs, agentBubbleForTiming);
-            if (event.status === "error") {
+            if (event.status === "cancelled") {
+              appendSystemNote("Ответ агента прерван.");
+              setStatus("готов", "", lastResponseElapsedMs);
+              saveHistoryToStorage();
+            } else if (event.status === "error") {
               let errorDetail = "Агент завершил run со статусом error";
               if (event.result && String(event.result).trim()) {
                 errorDetail = String(event.result).trim();
@@ -1477,57 +1817,80 @@
           }
         }
 
-        const responseBodyReader = fetchResponse.body.getReader();
-        const textDecoder = new TextDecoder();
-        let buffer = "";
+        try {
+          const responseBodyReader = fetchResponse.body.getReader();
+          const textDecoder = new TextDecoder();
+          let buffer = "";
 
-        while (true) {
-          const readResult = await responseBodyReader.read();
-          if (readResult.done) {
-            break;
+          while (true) {
+            const readResult = await responseBodyReader.read();
+            if (readResult.done) {
+              break;
+            }
+            buffer += textDecoder.decode(readResult.value, { stream: true });
+            let lineBreakIndex = buffer.indexOf("\n");
+            while (lineBreakIndex !== -1) {
+              const line = buffer.slice(0, lineBreakIndex).trimEnd();
+              buffer = buffer.slice(lineBreakIndex + 1);
+              processSseLine(line);
+              lineBreakIndex = buffer.indexOf("\n");
+            }
           }
-          buffer += textDecoder.decode(readResult.value, { stream: true });
-          let lineBreakIndex = buffer.indexOf("\n");
-          while (lineBreakIndex !== -1) {
-            const line = buffer.slice(0, lineBreakIndex).trimEnd();
-            buffer = buffer.slice(lineBreakIndex + 1);
-            processSseLine(line);
-            lineBreakIndex = buffer.indexOf("\n");
-          }
-        }
 
-        const trailingSseLines = buffer.split("\n");
-        for (const trailingLine of trailingSseLines) {
-          processSseLine(trailingLine.trimEnd());
+          const trailingSseLines = buffer.split("\n");
+          for (const trailingLine of trailingSseLines) {
+            processSseLine(trailingLine.trimEnd());
+          }
+        } catch (streamError) {
+          if (streamError && streamError.name === "AbortError") {
+            chatWasCancelledByUser = true;
+            if (!voiceRunErrorDetail) {
+              appendSystemNote("Запрос прерван.");
+              setStatus("готов", "");
+            }
+          } else {
+            throw streamError;
+          }
         }
 
         const agentBubbleForAutoSpeech =
           currentAgentBubbleElement || findLastAgentMessageBubble();
 
-        isRequestInFlight = false;
-        setComposerEnabled(true);
-
-        if (lastResponseElapsedMs === null) {
+        if (lastResponseElapsedMs === null && !chatWasCancelledByUser) {
           lastResponseElapsedMs = performance.now() - responseStartedAtMs;
         }
 
-        applyChatResponseTiming(lastResponseElapsedMs, agentBubbleForAutoSpeech);
+        if (!chatWasCancelledByUser) {
+          applyChatResponseTiming(lastResponseElapsedMs, agentBubbleForAutoSpeech);
 
-        if (lastRunSucceeded && replyWithSpeechAfterRun && voiceEnabled) {
-          await autoSpeakLastAgentReply(agentBubbleForAutoSpeech);
-        } else if (voiceRunErrorDetail && replyWithSpeechAfterRun && voiceEnabled) {
-          await playVoiceBriefNotice(resolveVoiceErrorBriefSpeech(voiceRunErrorDetail));
-        }
-        if (statusPillElement.className !== "error" && !activeSpeakButtonElement) {
-          setStatus("готов", "", lastResponseElapsedMs);
+          if (lastRunSucceeded && replyWithSpeechAfterRun && voiceEnabled) {
+            await autoSpeakLastAgentReply(agentBubbleForAutoSpeech);
+          } else if (voiceRunErrorDetail && replyWithSpeechAfterRun && voiceEnabled) {
+            await playVoiceBriefNotice(resolveVoiceErrorBriefSpeech(voiceRunErrorDetail));
+          }
+          if (statusPillElement.className !== "error" && !activeSpeakButtonElement) {
+            setStatus("готов", "", lastResponseElapsedMs);
+          }
         }
 
-        currentAgentBubbleElement = null;
-        inputElement.focus();
+        } finally {
+          if (agentActivityTracking) {
+            finalizeAgentActivityPanel("cancelled");
+          }
+          isRequestInFlight = false;
+          chatAbortController = null;
+          currentAgentBubbleElement = null;
+          setComposerEnabled(true);
+          inputElement.focus();
+        }
       }
 
       sendButton.addEventListener("click", () => {
         void postChatStream();
+      });
+
+      cancelChatButton.addEventListener("click", () => {
+        void cancelActiveChatRequest();
       });
 
       voiceRecordButton.addEventListener("click", () => {

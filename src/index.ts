@@ -122,6 +122,40 @@ const basicAuthPassword = process.env.CHAT_BASIC_PASSWORD?.trim();
 const workspaceAgents = new Map<string, WorkspaceAgentRecord>();
 const sessionLocks = new Map<string, SessionLockRecord>();
 
+interface ActiveChatRunRecord {
+  run: Run;
+  workspaceId: string;
+}
+
+const activeChatRunsBySession = new Map<string, ActiveChatRunRecord>();
+const cancelledChatSessions = new Set<string>();
+
+async function cancelActiveChatRunForSession(
+  sessionId: string,
+  workspaceId: string,
+): Promise<boolean> {
+  cancelledChatSessions.add(sessionId);
+  const activeRecord = activeChatRunsBySession.get(sessionId);
+  if (!activeRecord || activeRecord.workspaceId !== workspaceId) {
+    return false;
+  }
+  if (activeRecord.run.supports("cancel")) {
+    try {
+      await activeRecord.run.cancel();
+    } catch (cancelError) {
+      logServerMessage(
+        `chat cancel run ${activeRecord.run.id}: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
+      );
+    }
+  }
+  return true;
+}
+
+function clearChatCancellationState(sessionId: string): void {
+  cancelledChatSessions.delete(sessionId);
+  activeChatRunsBySession.delete(sessionId);
+}
+
 interface RuntimeModelCatalog {
   models: Array<{ id: string; label: string }>;
   ids: Set<string>;
@@ -734,6 +768,10 @@ function writeSseDataLine(
   payload: Record<string, unknown>,
 ): void {
   response.write(`data: ${JSON.stringify(payload)}\n\n`);
+  const responseWithFlush = response as express.Response & { flush?: () => void };
+  if (typeof responseWithFlush.flush === "function") {
+    responseWithFlush.flush();
+  }
 }
 
 function extractAssistantTextDelta(message: SDKAssistantMessage): string {
@@ -755,7 +793,10 @@ function describeStreamMessageForClient(message: SDKMessage): Record<string, unk
     return null;
   }
   if (message.type === "thinking") {
-    return { kind: "thinking", text: message.text };
+    const thinkingText = message.text?.trim() ?? "";
+    const truncatedThinkingText =
+      thinkingText.length > 240 ? `${thinkingText.slice(0, 240)}…` : thinkingText;
+    return { kind: "thinking", text: truncatedThinkingText };
   }
   if (message.type === "tool_call") {
     const toolMessage = message as SDKToolUseMessage;
@@ -767,6 +808,14 @@ function describeStreamMessageForClient(message: SDKMessage): Record<string, unk
   }
   if (message.type === "status") {
     return { kind: "status", status: message.status, message: message.message };
+  }
+  if (message.type === "task") {
+    const taskText = message.text?.trim() ?? "";
+    const taskStatus = message.status?.trim() ?? "";
+    if (!taskText && !taskStatus) {
+      return null;
+    }
+    return { kind: "task", status: taskStatus, text: taskText };
   }
   return null;
 }
@@ -816,6 +865,13 @@ async function runAgentStreamToCompletion(
   }
 
   if (!streamOptions.shouldContinue()) {
+    if (streamOptions.writeClientEvent) {
+      streamOptions.writeClientEvent({
+        kind: "run_finished",
+        status: "cancelled",
+        runId: agentRun.id,
+      });
+    }
     return { status: "cancelled", runId: agentRun.id };
   }
 
@@ -935,6 +991,7 @@ async function executeChatMessageCore(
     recreateWorkspaceAgent: boolean;
     responseMode: ChatResponseMode;
     modelId: string;
+    sessionId?: string;
   },
 ): Promise<ChatMessageRunResult> {
   if (options.recreateWorkspaceAgent) {
@@ -943,6 +1000,10 @@ async function executeChatMessageCore(
   }
 
   const workspaceRecord = await getOrCreateWorkspaceAgent(workspace, options.modelId);
+  streamSink.writeClientEvent?.({
+    kind: "activity",
+    message: "Сбор контекста и памяти…",
+  });
   const dateTimePrefix = buildCurrentDateTimeContextPrefix();
   const stylePrefix = buildChatResponseStylePrefix(options.responseMode);
   const brainPrefix = await buildBrainContextPrefix({
@@ -964,16 +1025,39 @@ async function executeChatMessageCore(
       : payloadWithContext;
 
   const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
+  streamSink.writeClientEvent?.({
+    kind: "activity",
+    message: "Запуск агента…",
+  });
   const agentRun = await workspaceRecord.agent.send(payloadWithBrain, sendOptions);
+  streamSink.writeClientEvent?.({
+    kind: "activity",
+    message: "Агент выполняет задачу…",
+    runId: agentRun.id,
+  });
+
+  if (options.sessionId) {
+    activeChatRunsBySession.set(options.sessionId, {
+      run: agentRun,
+      workspaceId: workspace.id,
+    });
+  }
 
   let assistantAccumulatedText = "";
-  const runOutcome = await runAgentStreamToCompletion(agentRun, {
-    onAssistantText: (textDelta) => {
-      assistantAccumulatedText += textDelta;
-    },
-    shouldContinue: streamSink.shouldContinue,
-    writeClientEvent: streamSink.writeClientEvent,
-  });
+  let runOutcome: { status: string; result?: string; runId: string };
+  try {
+    runOutcome = await runAgentStreamToCompletion(agentRun, {
+      onAssistantText: (textDelta) => {
+        assistantAccumulatedText += textDelta;
+      },
+      shouldContinue: streamSink.shouldContinue,
+      writeClientEvent: streamSink.writeClientEvent,
+    });
+  } finally {
+    if (options.sessionId) {
+      activeChatRunsBySession.delete(options.sessionId);
+    }
+  }
 
   const isVoiceResponseMode = options.responseMode === "voice";
   const sanitizedAssistantText = isVoiceResponseMode
@@ -1034,7 +1118,7 @@ async function executeChatMessageForWorkspace(
       shouldContinue: isClientStillConnected,
       writeClientEvent: (payload) => writeSseDataLine(response, payload),
     },
-    options,
+    { ...options, sessionId },
   );
 }
 
@@ -1069,7 +1153,13 @@ async function runChatTurnWithRetry(
       userMessagePayload,
       userMessageText,
       streamSink,
-      { forceLocalRun: false, recreateWorkspaceAgent: false, responseMode, modelId },
+      {
+        forceLocalRun: false,
+        recreateWorkspaceAgent: false,
+        responseMode,
+        modelId,
+        sessionId,
+      },
     );
   } catch (firstAttemptError) {
     const normalizedError = normalizeThrownError(firstAttemptError);
@@ -1104,6 +1194,7 @@ async function runChatTurnWithRetry(
         recreateWorkspaceAgent: shouldRecreateWorkspaceAgent,
         responseMode,
         modelId,
+        sessionId,
       },
     );
   }
@@ -1222,6 +1313,23 @@ application.get("/api/vpn-health", async (_request, response) => {
   response.json(probeResult);
 });
 
+application.post("/api/chat/cancel", async (request, response) => {
+  const sessionId = normalizeSessionId(request.body?.sessionId);
+  const workspace = resolveWorkspace(request.body?.workspaceId);
+
+  if (!sessionId) {
+    response.status(400).json({ error: "Нужен sessionId." });
+    return;
+  }
+
+  const runWasCancelled = await cancelActiveChatRunForSession(sessionId, workspace.id);
+  releaseChatTurnLocks(sessionId, workspace.id);
+  logServerMessage(
+    `session ${sessionId} chat cancel requested (run=${runWasCancelled ? "stopped" : "not found"})`,
+  );
+  response.json({ ok: true, cancelled: runWasCancelled });
+});
+
 application.post("/api/chat", async (request, response) => {
   const sessionId = normalizeSessionId(request.body?.sessionId);
   const workspace = resolveWorkspace(request.body?.workspaceId);
@@ -1297,7 +1405,19 @@ application.post("/api/chat", async (request, response) => {
     clientStillConnected = false;
   });
 
-  const isClientStillConnected = (): boolean => clientStillConnected && !response.writableEnded;
+  const isClientStillConnected = (): boolean =>
+    clientStillConnected && !response.writableEnded && !cancelledChatSessions.has(sessionId);
+
+  const chatRunStartedAtMs = Date.now();
+  const activityHeartbeatTimer = setInterval(() => {
+    if (!isClientStillConnected()) {
+      return;
+    }
+    writeSseDataLine(response, {
+      kind: "heartbeat",
+      elapsedMs: Date.now() - chatRunStartedAtMs,
+    });
+  }, 12000);
 
   try {
     try {
@@ -1379,16 +1499,9 @@ application.post("/api/chat", async (request, response) => {
       response.end();
     }
   } finally {
-    const sessionLockRecord = sessionLocks.get(sessionId);
-    if (sessionLockRecord) {
-      sessionLockRecord.busy = false;
-    }
-    const updatedWorkspace = workspaceAgents.get(workspace.id);
-    if (updatedWorkspace) {
-      updatedWorkspace.busy = false;
-      touchWorkspaceActivity(updatedWorkspace);
-      scheduleWorkspaceIdleDispose(workspace.id, updatedWorkspace);
-    }
+    clearInterval(activityHeartbeatTimer);
+    clearChatCancellationState(sessionId);
+    releaseChatTurnLocks(sessionId, workspace.id);
   }
 });
 
