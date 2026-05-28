@@ -445,10 +445,11 @@ function filterRuntimeModelOptionsByConfiguration(
 }
 
 async function getRuntimeModelCatalog(forceRefresh = false): Promise<RuntimeModelCatalog> {
-  const hasFreshCache =
+  if (
+    !forceRefresh &&
     runtimeModelCatalogCache &&
-    Date.now() - runtimeModelCatalogCache.fetchedAt < MODEL_CATALOG_TTL_MS;
-  if (!forceRefresh && hasFreshCache) {
+    Date.now() - runtimeModelCatalogCache.fetchedAt < MODEL_CATALOG_TTL_MS
+  ) {
     return runtimeModelCatalogCache;
   }
   if (runtimeModelCatalogInflight && !forceRefresh) {
