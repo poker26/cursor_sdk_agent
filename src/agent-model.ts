@@ -109,6 +109,20 @@ export function listAgentModelOptions(): AgentModelOption[] {
   return cachedModelOptions;
 }
 
+export function hasCustomModelConfiguration(): boolean {
+  return Boolean(
+    process.env.CURSOR_MODELS_JSON?.trim() || process.env.CURSOR_MODEL_IDS?.trim(),
+  );
+}
+
+export function findConfiguredModelLabel(modelId: string): string | undefined {
+  const normalized = normalizeModelId(modelId);
+  if (!normalized) {
+    return undefined;
+  }
+  return listAgentModelOptions().find((option) => option.id === normalized)?.label;
+}
+
 export function isAllowedAgentModelId(modelId: string): boolean {
   const normalized = normalizeModelId(modelId);
   return listAgentModelOptions().some((option) => option.id === normalized);

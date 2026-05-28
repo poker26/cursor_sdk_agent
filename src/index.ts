@@ -8,8 +8,10 @@ import {
   Agent,
   AgentBusyError,
   AuthenticationError,
+  Cursor,
   convertError,
   CursorAgentError,
+  type SDKModel,
   type McpServerConfig,
   type Run,
   type SDKAgent,
@@ -32,9 +34,9 @@ import { deleteQdrantCollection } from "./brain/qdrant-brain.js";
 import { clearMemoryFile } from "./memory.js";
 import {
   getDefaultAgentModelId,
-  InvalidAgentModelIdError,
+  findConfiguredModelLabel,
+  hasCustomModelConfiguration,
   listAgentModelOptions,
-  resolveRequestedAgentModelId,
 } from "./agent-model.js";
 import {
   clearPersistedAgentId,
@@ -118,6 +120,21 @@ const basicAuthPassword = process.env.CHAT_BASIC_PASSWORD?.trim();
 
 const workspaceAgents = new Map<string, WorkspaceAgentRecord>();
 const sessionLocks = new Map<string, SessionLockRecord>();
+
+interface RuntimeModelCatalog {
+  models: Array<{ id: string; label: string }>;
+  ids: Set<string>;
+  defaultModelId: string;
+  fetchedAt: number;
+}
+
+const MODEL_CATALOG_TTL_MS = Number.parseInt(
+  process.env.MODEL_CATALOG_TTL_MS || "60000",
+  10,
+);
+
+let runtimeModelCatalogCache: RuntimeModelCatalog | undefined;
+let runtimeModelCatalogInflight: Promise<RuntimeModelCatalog> | undefined;
 
 function sendUnauthorizedResponse(response: express.Response): void {
   response.setHeader("WWW-Authenticate", 'Basic realm="cursor-chat"');
@@ -377,18 +394,114 @@ function listConfiguredMcpServersForDiagnostics(): Array<{ id: string; transport
   });
 }
 
-function resolveModelIdForRequest(
+async function fetchRuntimeModelCatalog(): Promise<RuntimeModelCatalog> {
+  const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
+  const sdkModels = await Cursor.models.list({ apiKey });
+  const availableOptions = normalizeRuntimeModelOptions(sdkModels);
+  const filteredOptions = filterRuntimeModelOptionsByConfiguration(availableOptions);
+  if (filteredOptions.length === 0) {
+    throw new Error(
+      "Cursor API вернул пустой список моделей. Проверьте доступы API key и тариф.",
+    );
+  }
+  const defaultFromEnvironment = getDefaultAgentModelId();
+  const defaultModelId = filteredOptions.some(
+    (option) => option.id === defaultFromEnvironment,
+  )
+    ? defaultFromEnvironment
+    : filteredOptions[0].id;
+  return {
+    models: filteredOptions,
+    ids: new Set(filteredOptions.map((option) => option.id)),
+    defaultModelId,
+    fetchedAt: Date.now(),
+  };
+}
+
+function normalizeRuntimeModelOptions(
+  sdkModels: SDKModel[],
+): Array<{ id: string; label: string }> {
+  const uniqueById = new Map<string, { id: string; label: string }>();
+  for (const modelItem of sdkModels) {
+    const modelId = modelItem.id?.trim();
+    if (!modelId) {
+      continue;
+    }
+    const configuredLabel = findConfiguredModelLabel(modelId);
+    const modelLabel = configuredLabel || modelItem.displayName?.trim() || modelId;
+    uniqueById.set(modelId, { id: modelId, label: modelLabel });
+  }
+  return [...uniqueById.values()];
+}
+
+function filterRuntimeModelOptionsByConfiguration(
+  runtimeModels: Array<{ id: string; label: string }>,
+): Array<{ id: string; label: string }> {
+  if (!hasCustomModelConfiguration()) {
+    return runtimeModels;
+  }
+  const configuredIds = new Set(listAgentModelOptions().map((option) => option.id));
+  return runtimeModels.filter((option) => configuredIds.has(option.id));
+}
+
+async function getRuntimeModelCatalog(forceRefresh = false): Promise<RuntimeModelCatalog> {
+  const hasFreshCache =
+    runtimeModelCatalogCache &&
+    Date.now() - runtimeModelCatalogCache.fetchedAt < MODEL_CATALOG_TTL_MS;
+  if (!forceRefresh && hasFreshCache) {
+    return runtimeModelCatalogCache;
+  }
+  if (runtimeModelCatalogInflight && !forceRefresh) {
+    return runtimeModelCatalogInflight;
+  }
+  runtimeModelCatalogInflight = fetchRuntimeModelCatalog()
+    .then((catalog) => {
+      runtimeModelCatalogCache = catalog;
+      return catalog;
+    })
+    .finally(() => {
+      runtimeModelCatalogInflight = undefined;
+    });
+  return runtimeModelCatalogInflight;
+}
+
+async function resolveModelIdForRequest(
   response: express.Response,
   rawModelId: unknown,
-): string | undefined {
+): Promise<string | undefined> {
   try {
-    return resolveRequestedAgentModelId(rawModelId);
-  } catch (modelError) {
-    if (modelError instanceof InvalidAgentModelIdError) {
-      response.status(400).json({ error: modelError.message });
+    const modelCatalog = await getRuntimeModelCatalog();
+    if (rawModelId === undefined || rawModelId === null || rawModelId === "") {
+      return modelCatalog.defaultModelId;
+    }
+    if (typeof rawModelId !== "string") {
+      response.status(400).json({
+        error: `Некорректный modelId: ${String(rawModelId)}.`,
+      });
       return undefined;
     }
-    throw modelError;
+    const normalizedModelId = rawModelId.trim();
+    if (!normalizedModelId) {
+      return modelCatalog.defaultModelId;
+    }
+    if (!modelCatalog.ids.has(normalizedModelId)) {
+      response.status(400).json({
+        error: `Модель «${normalizedModelId}» недоступна для текущего API key. Доступны: ${modelCatalog.models
+          .map((item) => item.id)
+          .join(", ")}.`,
+      });
+      return undefined;
+    }
+    return normalizedModelId;
+  } catch (modelCatalogError) {
+    const message =
+      modelCatalogError instanceof Error
+        ? modelCatalogError.message
+        : String(modelCatalogError);
+    response.status(503).json({
+      error: `Не удалось загрузить список моделей Cursor: ${message}`,
+    });
+    return undefined;
   }
 }
 
@@ -993,8 +1106,21 @@ application.get("/health", (_request, response) => {
 
 application.use(optionalBasicAuthMiddleware);
 
-application.get("/api/config", (_request, response) => {
+application.get("/api/config", async (_request, response) => {
   const configuredMcpServers = listConfiguredMcpServersForDiagnostics();
+  let runtimeModelCatalog: RuntimeModelCatalog;
+  try {
+    runtimeModelCatalog = await getRuntimeModelCatalog();
+  } catch (modelCatalogError) {
+    const message =
+      modelCatalogError instanceof Error
+        ? modelCatalogError.message
+        : String(modelCatalogError);
+    response.status(503).json({
+      error: `Не удалось загрузить список моделей Cursor: ${message}`,
+    });
+    return;
+  }
   response.json({
     defaultWorkspaceId,
     workspaces: workspaceRegistry.map((entry) => ({
@@ -1005,8 +1131,8 @@ application.get("/api/config", (_request, response) => {
     mcpServers: configuredMcpServers,
     mcpServerIds: configuredMcpServers.map((entry) => entry.id),
     uploadMaxBytes: UPLOAD_MAX_BYTES,
-    defaultModelId: getDefaultAgentModelId(),
-    models: listAgentModelOptions(),
+    defaultModelId: runtimeModelCatalog.defaultModelId,
+    models: runtimeModelCatalog.models,
     vpnHealth: {
       healthUrl: getVpnHealthUrl(),
       pollIntervalMs: getVpnHealthPollIntervalMs(),
@@ -1079,7 +1205,7 @@ application.post("/api/chat", async (request, response) => {
   const userMessageText = typeof request.body?.message === "string" ? request.body.message : "";
   const responseMode = parseChatResponseMode(request.body?.responseMode);
   const attachments = parseClientAttachments(request.body?.attachments);
-  const resolvedModelId = resolveModelIdForRequest(response, request.body?.modelId);
+  const resolvedModelId = await resolveModelIdForRequest(response, request.body?.modelId);
   if (!resolvedModelId) {
     return;
   }

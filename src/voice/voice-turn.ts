@@ -43,7 +43,7 @@ export interface VoiceTurnRouteHost {
   resolveModelId: (
     response: express.Response,
     rawModelId: unknown,
-  ) => string | undefined;
+  ) => Promise<string | undefined>;
   runChatTurnWithRetry: (
     workspace: WorkspaceEntry,
     sessionId: string,
@@ -74,7 +74,7 @@ export function registerVoiceTurnRoute(
     const sessionId = host.normalizeSessionId(requestBody.sessionId);
     const workspace = host.resolveWorkspace(requestBody.workspaceId);
     const responseMode = parseChatResponseMode(requestBody.responseMode ?? "voice");
-    const resolvedModelId = host.resolveModelId(response, requestBody.modelId);
+    const resolvedModelId = await host.resolveModelId(response, requestBody.modelId);
     if (!resolvedModelId) {
       return;
     }
