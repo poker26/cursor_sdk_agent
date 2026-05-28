@@ -11,6 +11,7 @@ import {
   Cursor,
   convertError,
   CursorAgentError,
+  type ModelSelection,
   type SDKModel,
   type McpServerConfig,
   type Run,
@@ -124,6 +125,7 @@ const sessionLocks = new Map<string, SessionLockRecord>();
 interface RuntimeModelCatalog {
   models: Array<{ id: string; label: string }>;
   ids: Set<string>;
+  selectionById: Map<string, ModelSelection>;
   defaultModelId: string;
   fetchedAt: number;
 }
@@ -413,6 +415,9 @@ async function fetchRuntimeModelCatalog(): Promise<RuntimeModelCatalog> {
   return {
     models: filteredOptions,
     ids: new Set(filteredOptions.map((option) => option.id)),
+    selectionById: new Map(
+      filteredOptions.map((option) => [option.id, option.selection] as [string, ModelSelection]),
+    ),
     defaultModelId,
     fetchedAt: Date.now(),
   };
@@ -420,8 +425,8 @@ async function fetchRuntimeModelCatalog(): Promise<RuntimeModelCatalog> {
 
 function normalizeRuntimeModelOptions(
   sdkModels: SDKModel[],
-): Array<{ id: string; label: string }> {
-  const uniqueById = new Map<string, { id: string; label: string }>();
+): Array<{ id: string; label: string; selection: ModelSelection }> {
+  const uniqueById = new Map<string, { id: string; label: string; selection: ModelSelection }>();
   for (const modelItem of sdkModels) {
     const modelId = modelItem.id?.trim();
     if (!modelId) {
@@ -429,19 +434,34 @@ function normalizeRuntimeModelOptions(
     }
     const configuredLabel = findConfiguredModelLabel(modelId);
     const modelLabel = configuredLabel || modelItem.displayName?.trim() || modelId;
-    uniqueById.set(modelId, { id: modelId, label: modelLabel });
+    const defaultVariant =
+      modelItem.variants?.find((variant) => variant.isDefault) ??
+      modelItem.variants?.[0];
+    const selection: ModelSelection = defaultVariant?.params?.length
+      ? { id: modelId, params: defaultVariant.params }
+      : { id: modelId };
+    uniqueById.set(modelId, { id: modelId, label: modelLabel, selection });
   }
   return [...uniqueById.values()];
 }
 
 function filterRuntimeModelOptionsByConfiguration(
-  runtimeModels: Array<{ id: string; label: string }>,
-): Array<{ id: string; label: string }> {
+  runtimeModels: Array<{ id: string; label: string; selection: ModelSelection }>,
+): Array<{ id: string; label: string; selection: ModelSelection }> {
   if (!hasCustomModelConfiguration()) {
     return runtimeModels;
   }
   const configuredIds = new Set(listAgentModelOptions().map((option) => option.id));
   return runtimeModels.filter((option) => configuredIds.has(option.id));
+}
+
+async function resolveModelSelection(modelId: string): Promise<ModelSelection> {
+  const modelCatalog = await getRuntimeModelCatalog();
+  const selection = modelCatalog.selectionById.get(modelId);
+  if (selection) {
+    return selection;
+  }
+  return { id: modelId };
 }
 
 async function getRuntimeModelCatalog(forceRefresh = false): Promise<RuntimeModelCatalog> {
@@ -511,6 +531,7 @@ async function createChatAgent(
   modelId: string,
 ): Promise<SDKAgent> {
   const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
+  const modelSelection = await resolveModelSelection(modelId);
   const mcpServers = buildMcpServersConfiguration();
   const mcpServerIds = mcpServers ? Object.keys(mcpServers) : [];
   if (mcpServerIds.length > 0) {
@@ -521,7 +542,7 @@ async function createChatAgent(
 
   return Agent.create({
     apiKey,
-    model: { id: modelId },
+    model: modelSelection,
     local: {
       cwd: workspace.path,
       settingSources: [],
@@ -550,10 +571,11 @@ async function resumeOrCreateWorkspaceAgent(
   if (persistedAgentId && canResumePersistedAgent) {
     try {
       const apiKey = readRequiredEnvironmentVariable("CURSOR_API_KEY");
+      const modelSelection = await resolveModelSelection(modelId);
       const mcpServers = buildMcpServersConfiguration();
       const agent = await Agent.resume(persistedAgentId, {
         apiKey,
-        model: { id: modelId },
+        model: modelSelection,
         local: {
           cwd: workspace.path,
           settingSources: [],
