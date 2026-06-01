@@ -12,7 +12,7 @@
     "brain:ingest": "tsx scripts/brain-ingest.ts"
   },
   "dependencies": {
-    "@cursor/sdk": "1.0.13",
+    "@cursor/sdk": "1.0.17",
     "@supabase/supabase-js": "^2.49.1",
     "dotenv": "^16.4.5",
     "express": "^4.21.0"
