@@ -406,7 +406,35 @@ function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undef
 
   mergeMcpServersFromJsonEnv(servers);
 
+  addNotionStdioMcpServerIfConfigured(servers);
+
   return Object.keys(servers).length > 0 ? servers : undefined;
+}
+
+function resolveNpxCommandPath(): string {
+  const configuredPath = process.env.NOTION_MCP_NPX_PATH?.trim();
+  if (configuredPath) {
+    return configuredPath;
+  }
+  return path.join(path.dirname(process.execPath), "npx");
+}
+
+function addNotionStdioMcpServerIfConfigured(
+  targetServers: Record<string, McpServerConfig>,
+): void {
+  if (targetServers.notion) {
+    return;
+  }
+  const notionToken = process.env.NOTION_TOKEN?.trim();
+  if (!notionToken) {
+    return;
+  }
+  targetServers.notion = {
+    type: "stdio",
+    command: resolveNpxCommandPath(),
+    args: ["-y", "@notionhq/notion-mcp-server"],
+    env: { NOTION_TOKEN: notionToken },
+  };
 }
 
 function listConfiguredMcpServersForDiagnostics(): Array<{ id: string; transport: string; endpoint: string }> {
