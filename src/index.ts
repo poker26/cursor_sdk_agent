@@ -356,6 +356,34 @@ function addHttpMcpServerIfConfigured(
   };
 }
 
+function addHttpMcpServerWithOptionalApiKey(
+  targetServers: Record<string, McpServerConfig>,
+  serverLabel: string,
+  baseUrl: string | undefined,
+  apiKeyValue: string | undefined,
+): void {
+  const trimmedUrl = baseUrl?.trim();
+  const trimmedKey = apiKeyValue?.trim();
+  if (!trimmedUrl && !trimmedKey) {
+    return;
+  }
+  if (!trimmedUrl) {
+    throw new Error(`MCP "${serverLabel}": нужен URL.`);
+  }
+  if (trimmedKey) {
+    targetServers[serverLabel] = {
+      type: "http",
+      url: trimmedUrl,
+      headers: { "X-API-Key": trimmedKey },
+    };
+    return;
+  }
+  targetServers[serverLabel] = {
+    type: "http",
+    url: trimmedUrl,
+  };
+}
+
 function mergeMcpServersFromJsonEnv(targetServers: Record<string, McpServerConfig>): void {
   const rawJson = process.env.MCP_EXTRA_JSON?.trim();
   if (!rawJson) {
@@ -402,6 +430,12 @@ function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undef
     "exchange_work",
     process.env.EXCHANGE_MCP_URL,
     process.env.EXCHANGE_MCP_API_KEY,
+  );
+  addHttpMcpServerWithOptionalApiKey(
+    servers,
+    "historical-recipes",
+    process.env.HISTORICAL_RECIPES_MCP_URL,
+    process.env.HISTORICAL_RECIPES_MCP_API_KEY,
   );
 
   mergeMcpServersFromJsonEnv(servers);
