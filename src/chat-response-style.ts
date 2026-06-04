@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 export type ChatResponseMode = "text" | "voice";
 
-const CHAT_UI_BASE_STYLE = `[Стиль ответа в веб-чате — обязательно]
+const CHAT_UI_DEFAULT_BASE_STYLE = `[Стиль ответа в веб-чате — обязательно]
 
 Аудитория: руководитель платежей. Нужен только ответ на заданный вопрос. Не отчёт, не сопровождение процесса.
 
@@ -35,7 +38,7 @@ const CHAT_UI_BASE_STYLE = `[Стиль ответа в веб-чате — об
 Нарушение (так НЕЛЬЗЯ):
 «Запрашиваю календарь через Exchange… Одно пересечение… Для краткой сводки: неделя взята как 25.05–31.05».`;
 
-const CHAT_RESPONSE_STYLE_SUFFIX = `
+const CHAT_RESPONSE_STYLE_DEFAULT_SUFFIX = `
 
 ---
 [Жёстко: только факт на вопрос. Без Exchange, без «по блоку/в выгрузке», без объяснения исключений.]`;
@@ -45,6 +48,32 @@ const CHAT_UI_VOICE_EXTRA_STYLE = `[Голосовой запрос]
 - Те же правила краткости; обычно 1–3 предложения.
 - Без URL, без «Ссылки:», без e-mail.
 - Время: «в двенадцать», без часовых поясов.`;
+
+/**
+ * Base voice style block. Override per instance with CHAT_VOICE_STYLE_PATH
+ * (a markdown/text file) to drop work-specific wording (payments, Exchange).
+ * Read once at startup; falls back to the built-in default.
+ */
+function loadVoiceBaseStyle(): { baseStyle: string; suffix: string } {
+  const overridePath = process.env.CHAT_VOICE_STYLE_PATH?.trim();
+  if (overridePath) {
+    try {
+      const fileContent = readFileSync(resolve(overridePath), "utf8").trim();
+      if (fileContent) {
+        return { baseStyle: fileContent, suffix: "" };
+      }
+    } catch {
+      /* fall back to the default style */
+    }
+  }
+  return {
+    baseStyle: CHAT_UI_DEFAULT_BASE_STYLE,
+    suffix: CHAT_RESPONSE_STYLE_DEFAULT_SUFFIX,
+  };
+}
+
+const { baseStyle: CHAT_UI_BASE_STYLE, suffix: CHAT_RESPONSE_STYLE_SUFFIX } =
+  loadVoiceBaseStyle();
 
 export function parseChatResponseMode(rawValue: unknown): ChatResponseMode {
   if (rawValue === "voice") {

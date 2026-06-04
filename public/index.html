@@ -506,6 +506,8 @@
       let pendingAttachments = [];
       let vpnHealthPollIntervalMs = 20000;
       let vpnHealthPollTimer = null;
+      let uiShowVpnIndicator = true;
+      let uiAllowAttachments = true;
       let voiceEnabled = false;
       let voiceAutoSend = true;
       let voiceErrorBriefSpeech = "Не удалось выполнить запрос. Подробности в чате.";
@@ -1508,6 +1510,23 @@
         if (config.vpnHealth && config.vpnHealth.pollIntervalMs) {
           vpnHealthPollIntervalMs = config.vpnHealth.pollIntervalMs;
         }
+        const uiFlags = config.ui || {};
+        uiShowVpnIndicator = uiFlags.showVpnIndicator !== false;
+        uiAllowAttachments = uiFlags.allowAttachments !== false;
+        if (!uiShowVpnIndicator && vpnIndicatorElement) {
+          vpnIndicatorElement.hidden = true;
+        }
+        if (!uiAllowAttachments) {
+          if (attachButton) {
+            attachButton.hidden = true;
+          }
+          if (attachInputElement) {
+            attachInputElement.hidden = true;
+          }
+          if (attachListElement) {
+            attachListElement.hidden = true;
+          }
+        }
         if (config.voice && config.voice.enabled) {
           voiceEnabled = true;
           voiceAutoSend = config.voice.autoSend !== false;
@@ -1990,7 +2009,9 @@
 
       async function bootstrap() {
         await loadServerConfig();
-        startVpnHealthPolling();
+        if (uiShowVpnIndicator) {
+          startVpnHealthPolling();
+        }
         const historyMessages = loadHistoryFromStorage();
         if (!chatSessionId) {
           await startNewChat();

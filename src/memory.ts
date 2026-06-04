@@ -43,6 +43,34 @@ export const MEMORY_BOOTSTRAP_TEMPLATE = `## Стартовый контекст
 ### Хронология сессий
 `;
 
+let cachedBootstrapTemplate: string | undefined;
+
+/**
+ * Returns the bootstrap text written into a fresh memory.md.
+ * Override per instance with MEMORY_BOOTSTRAP_PATH (e.g. a flora-specific prompt);
+ * falls back to the built-in payment-platform template.
+ */
+export async function getMemoryBootstrapTemplate(): Promise<string> {
+  if (cachedBootstrapTemplate !== undefined) {
+    return cachedBootstrapTemplate;
+  }
+  const overridePath = process.env.MEMORY_BOOTSTRAP_PATH?.trim();
+  if (overridePath) {
+    try {
+      const fileContent = await fs.readFile(path.resolve(overridePath), "utf8");
+      const trimmed = fileContent.trim();
+      if (trimmed) {
+        cachedBootstrapTemplate = trimmed;
+        return cachedBootstrapTemplate;
+      }
+    } catch {
+      /* fall back to the built-in template */
+    }
+  }
+  cachedBootstrapTemplate = MEMORY_BOOTSTRAP_TEMPLATE;
+  return cachedBootstrapTemplate;
+}
+
 export function resolveMemoryFilePath(workspacePath: string): string {
   return path.join(workspacePath, MEMORY_DIRECTORY_NAME, MEMORY_FILE_NAME);
 }
@@ -67,7 +95,8 @@ export async function ensureMemoryFileExists(workspacePath: string): Promise<str
   try {
     await fs.access(memoryFilePath);
   } catch {
-    await fs.writeFile(memoryFilePath, `${MEMORY_BOOTSTRAP_TEMPLATE}\n`, "utf8");
+    const bootstrapTemplate = await getMemoryBootstrapTemplate();
+    await fs.writeFile(memoryFilePath, `${bootstrapTemplate}\n`, "utf8");
   }
   return memoryFilePath;
 }
@@ -123,7 +152,7 @@ export async function appendMemorySessionLog(
   try {
     existingContent = await fs.readFile(memoryFilePath, "utf8");
   } catch {
-    existingContent = MEMORY_BOOTSTRAP_TEMPLATE;
+    existingContent = await getMemoryBootstrapTemplate();
   }
 
   let combined = `${existingContent.trimEnd()}${sessionBlock}`;

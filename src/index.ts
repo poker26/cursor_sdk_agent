@@ -97,6 +97,21 @@ const MONITOR_TICK_MS = Number.parseInt(
   10,
 );
 
+function isEnvFlagEnabled(rawValue: string | undefined, defaultEnabled: boolean): boolean {
+  const normalized = rawValue?.trim().toLowerCase();
+  if (!normalized) {
+    return defaultEnabled;
+  }
+  return normalized !== "false" && normalized !== "0" && normalized !== "no";
+}
+
+function getUiFeatureFlags(): { showVpnIndicator: boolean; allowAttachments: boolean } {
+  return {
+    showVpnIndicator: isEnvFlagEnabled(process.env.UI_SHOW_VPN_INDICATOR, true),
+    allowAttachments: isEnvFlagEnabled(process.env.UI_ALLOW_ATTACHMENTS, true),
+  };
+}
+
 const UPLOAD_MAX_BYTES = Number.parseInt(
   process.env.UPLOAD_MAX_BYTES || String(3 * 1024 * 1024),
   10,
@@ -1340,6 +1355,7 @@ application.get("/api/config", async (_request, response) => {
       embeddingProvider: getEmbeddingProviderLabel(),
     },
     voice: getVoicePublicConfig(),
+    ui: getUiFeatureFlags(),
   });
 });
 
