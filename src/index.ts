@@ -69,12 +69,27 @@ import {
   RunDiagnosticsCollector,
   resolveRunErrorDetailText,
 } from "./run-diagnostics.js";
+import {
+  getJiraBaseUrl,
+  isMonitoringEnabled,
+  listEpicMonitoring,
+  parseMonitoringCommand,
+  pollAllActiveEpics,
+  registerEpicMonitoring,
+  unregisterEpicMonitoring,
+  type MonitoringCommand,
+} from "./monitor/jira-epic-monitor.js";
 
 const currentDirPath = path.dirname(fileURLToPath(import.meta.url));
 const publicDirPath = path.join(currentDirPath, "..", "public");
 
 const SESSION_IDLE_DISPOSE_MS = Number.parseInt(
   process.env.SESSION_IDLE_DISPOSE_MS || String(30 * 60 * 1000),
+  10,
+);
+
+const MONITOR_POLL_MS = Number.parseInt(
+  process.env.MONITOR_POLL_MS || String(30 * 60 * 1000),
   10,
 );
 
@@ -1392,6 +1407,111 @@ application.post("/api/chat/cancel", async (request, response) => {
   response.json({ ok: true, cancelled: runWasCancelled });
 });
 
+function beginMonitoringSseResponse(
+  response: express.Response,
+  sessionId: string,
+  workspace: WorkspaceEntry,
+  modelId: string,
+): void {
+  response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  response.setHeader("Cache-Control", "no-cache, no-transform");
+  response.setHeader("Connection", "keep-alive");
+  response.setHeader("X-Chat-Session-Id", sessionId);
+  response.setHeader("X-Chat-Workspace-Id", workspace.id);
+  response.setHeader("X-Chat-Model-Id", modelId);
+  response.flushHeaders?.();
+  writeSseDataLine(response, {
+    kind: "session",
+    sessionId,
+    workspaceId: workspace.id,
+    modelId,
+  });
+}
+
+async function resolveMonitoringCommandReply(
+  workspace: WorkspaceEntry,
+  command: MonitoringCommand,
+): Promise<string> {
+  if (!isMonitoringEnabled()) {
+    return (
+      "Мониторинг Jira пока не настроен на сервере. Нужны переменные окружения: " +
+      "TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SUPABASE_URL/SUPABASE_SERVICE_KEY и ATLASSIAN_MCP_URL."
+    );
+  }
+
+  if (command.action === "list") {
+    const epics = await listEpicMonitoring(workspace.id);
+    if (epics.length === 0) {
+      return "Сейчас на мониторинге нет ни одного эпика.";
+    }
+    const lines = epics.map((epic) => {
+      const summary = epic.epic_summary ? ` — ${epic.epic_summary}` : "";
+      const pausedMark = epic.status === "active" ? "" : " (на паузе)";
+      return `• ${epic.epic_key}${summary}${pausedMark}`;
+    });
+    return `На мониторинге (${epics.length}):\n${lines.join("\n")}`;
+  }
+
+  if (command.action === "unregister") {
+    if (!command.epicKey) {
+      return "Уточните ключ эпика, который нужно снять с мониторинга (например, MNT-14980).";
+    }
+    const removed = await unregisterEpicMonitoring(workspace.id, command.epicKey);
+    return removed
+      ? `Снял ${command.epicKey} с мониторинга.`
+      : `${command.epicKey} не был на мониторинге.`;
+  }
+
+  if (!command.epicKey) {
+    return "Уточните ссылку или ключ эпика Jira (например, MNT-14980).";
+  }
+  const jiraBaseUrl = command.jiraBaseUrl ?? getJiraBaseUrl();
+  const pollMinutes = Math.max(1, Math.round(MONITOR_POLL_MS / 60000));
+  try {
+    const result = await registerEpicMonitoring(
+      workspace.id,
+      command.epicKey,
+      jiraBaseUrl,
+    );
+    const summarySuffix = result.epicSummary ? ` («${result.epicSummary}»)` : "";
+    return (
+      `Поставил ${command.epicKey}${summarySuffix} на мониторинг: ${result.childCount} задач(и). ` +
+      `Проверяю раз в ${pollMinutes} мин и присылаю в Telegram смену статусов, новые задачи, смену исполнителя/резолюции. ` +
+      "Подтверждение отправил в Telegram."
+    );
+  } catch (registerError) {
+    const message =
+      registerError instanceof Error ? registerError.message : String(registerError);
+    return `Не удалось поставить ${command.epicKey} на мониторинг: ${message}`;
+  }
+}
+
+async function respondToMonitoringCommand(
+  response: express.Response,
+  sessionId: string,
+  workspace: WorkspaceEntry,
+  modelId: string,
+  command: MonitoringCommand,
+): Promise<void> {
+  beginMonitoringSseResponse(response, sessionId, workspace, modelId);
+  try {
+    const replyText = await resolveMonitoringCommandReply(workspace, command);
+    writeSseDataLine(response, { kind: "assistant_text", text: replyText });
+    writeSseDataLine(response, {
+      kind: "run_finished",
+      status: "completed",
+      runId: `monitor-${Date.now()}`,
+    });
+  } catch (commandError) {
+    const message =
+      commandError instanceof Error ? commandError.message : String(commandError);
+    logServerMessage(`monitoring command failed: ${message}`);
+    writeSseDataLine(response, { kind: "error", message, sessionId });
+  } finally {
+    response.end();
+  }
+}
+
 application.post("/api/chat", async (request, response) => {
   const sessionId = normalizeSessionId(request.body?.sessionId);
   const workspace = resolveWorkspace(request.body?.workspaceId);
@@ -1405,6 +1525,22 @@ application.post("/api/chat", async (request, response) => {
 
   if (!userMessageText.trim() && attachments.length === 0) {
     response.status(400).json({ error: "Нужен текст сообщения и/или вложения." });
+    return;
+  }
+
+  const monitoringCommand =
+    attachments.length === 0 ? parseMonitoringCommand(userMessageText) : null;
+  if (monitoringCommand) {
+    logServerMessage(
+      `session ${sessionId} monitoring command: ${monitoringCommand.action} ${monitoringCommand.epicKey ?? ""}`.trim(),
+    );
+    await respondToMonitoringCommand(
+      response,
+      sessionId,
+      workspace,
+      resolvedModelId,
+      monitoringCommand,
+    );
     return;
   }
 
@@ -1676,6 +1812,48 @@ application.listen(listenPort, () => {
     logServerMessage("Brain Qdrant: enabled");
   }
 });
+
+let monitoringPollInFlight = false;
+
+async function runMonitoringPollCycle(): Promise<void> {
+  if (monitoringPollInFlight) {
+    return;
+  }
+  monitoringPollInFlight = true;
+  try {
+    const results = await pollAllActiveEpics();
+    const epicsWithChanges = results.filter((entry) => entry.changes > 0);
+    const failedEpics = results.filter((entry) => entry.error);
+    if (epicsWithChanges.length > 0 || failedEpics.length > 0) {
+      logServerMessage(
+        `monitor poll: epics=${results.length} changed=${epicsWithChanges.length} failed=${failedEpics.length}`,
+      );
+    }
+    for (const failed of failedEpics) {
+      logServerMessage(`monitor poll error ${failed.epicKey}: ${failed.error}`);
+    }
+  } catch (pollError) {
+    logServerMessage(
+      `monitor poll cycle failed: ${pollError instanceof Error ? pollError.message : String(pollError)}`,
+    );
+  } finally {
+    monitoringPollInFlight = false;
+  }
+}
+
+function startMonitoringScheduler(): void {
+  if (!isMonitoringEnabled()) {
+    logServerMessage("Jira monitoring: disabled (нет Telegram/Supabase/Atlassian MCP)");
+    return;
+  }
+  logServerMessage(`Jira monitoring: enabled (poll every ${Math.round(MONITOR_POLL_MS / 60000)} min)`);
+  const monitoringTimer = setInterval(() => {
+    void runMonitoringPollCycle();
+  }, MONITOR_POLL_MS);
+  monitoringTimer.unref?.();
+}
+
+startMonitoringScheduler();
 
 async function disposeAllWorkspaceAgentsOnShutdown(): Promise<void> {
   const workspaceIds = [...workspaceAgents.keys()];

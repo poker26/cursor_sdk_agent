@@ -31,6 +31,7 @@ export const MEMORY_BOOTSTRAP_TEMPLATE = `## Стартовый контекст
 - Почта: Exchange (+ Exchange MCP).
 - Заметки: Notion (+ MCP notion, NOTION_TOKEN на gateway).
 - Рецепты / Flora: historical-recipes (+ HISTORICAL_RECIPES_MCP_URL).
+- Мониторинг Jira-эпиков: команда в чате «Поставь <url> на мониторинг» → уведомления в Telegram (gateway, не агент).
 
 ### Стиль ответов в веб-чате cursor_sdk_agent
 - Только ответ на вопрос: без процесса, без «по блоку/в выгрузке», без объяснения кого не включили.
