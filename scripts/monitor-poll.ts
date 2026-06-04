@@ -1,7 +1,7 @@
 import "dotenv/config";
 import {
   isMonitoringEnabled,
-  pollAllActiveEpics,
+  pollDueActiveEpics,
 } from "../src/monitor/jira-epic-monitor.js";
 
 async function main(): Promise<void> {
@@ -12,8 +12,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const results = await pollAllActiveEpics();
+  const results = await pollDueActiveEpics();
   for (const result of results) {
+    if (result.skipped) {
+      continue;
+    }
     if (result.error) {
       console.error(`epic=${result.epicKey} error=${result.error}`);
     } else {

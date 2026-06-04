@@ -7,6 +7,7 @@ export interface MonitoredEpicRow {
   jira_base_url: string | null;
   telegram_chat_id: string | null;
   status: string;
+  poll_interval_ms: number | null;
   last_checked_at: string | null;
 }
 
@@ -33,6 +34,7 @@ export async function upsertMonitoredEpic(epic: {
   epicSummary: string;
   jiraBaseUrl: string | null;
   telegramChatId: string | null;
+  pollIntervalMs: number;
 }): Promise<void> {
   const client = requireSupabaseClient();
   const { error } = await client.from("monitored_epics").upsert(
@@ -42,6 +44,7 @@ export async function upsertMonitoredEpic(epic: {
       epic_summary: epic.epicSummary,
       jira_base_url: epic.jiraBaseUrl,
       telegram_chat_id: epic.telegramChatId,
+      poll_interval_ms: epic.pollIntervalMs,
       status: "active",
       last_checked_at: new Date().toISOString(),
     },
@@ -92,11 +95,31 @@ export async function deleteMonitoredEpic(
   return (data ?? []).length > 0;
 }
 
+export async function updateMonitoredEpicPollInterval(
+  workspaceId: string,
+  epicKey: string,
+  pollIntervalMs: number,
+): Promise<boolean> {
+  const client = requireSupabaseClient();
+  const { data, error } = await client
+    .from("monitored_epics")
+    .update({ poll_interval_ms: pollIntervalMs })
+    .eq("workspace_id", workspaceId)
+    .eq("epic_key", epicKey)
+    .select("epic_key");
+  if (error) {
+    throw new Error(`monitored_epics poll_interval update: ${error.message}`);
+  }
+  return (data ?? []).length > 0;
+}
+
 export async function listActiveMonitoredEpics(): Promise<MonitoredEpicRow[]> {
   const client = requireSupabaseClient();
   const { data, error } = await client
     .from("monitored_epics")
-    .select("workspace_id, epic_key, epic_summary, jira_base_url, telegram_chat_id, status, last_checked_at")
+    .select(
+      "workspace_id, epic_key, epic_summary, jira_base_url, telegram_chat_id, status, poll_interval_ms, last_checked_at",
+    )
     .eq("status", "active");
   if (error) {
     throw new Error(`monitored_epics list active: ${error.message}`);
@@ -110,7 +133,9 @@ export async function listMonitoredEpicsForWorkspace(
   const client = requireSupabaseClient();
   const { data, error } = await client
     .from("monitored_epics")
-    .select("workspace_id, epic_key, epic_summary, jira_base_url, telegram_chat_id, status, last_checked_at")
+    .select(
+      "workspace_id, epic_key, epic_summary, jira_base_url, telegram_chat_id, status, poll_interval_ms, last_checked_at",
+    )
     .eq("workspace_id", workspaceId)
     .order("created_at", { ascending: true });
   if (error) {

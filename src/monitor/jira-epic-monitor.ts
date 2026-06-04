@@ -14,23 +14,32 @@ import {
   loadIssueStateMap,
   replaceIssueStates,
   touchEpicChecked,
+  updateMonitoredEpicPollInterval,
   upsertIssueStates,
   upsertMonitoredEpic,
   type MonitoredEpicRow,
   type MonitoredIssueState,
 } from "./monitoring-store.js";
+import {
+  formatPollIntervalLabel,
+  getDefaultPollIntervalMs,
+  isEpicDueForPoll,
+  parsePollIntervalMsFromText,
+  resolveEpicPollIntervalMs,
+} from "./poll-interval.js";
 
 const JIRA_KEY_PATTERN = /\b([A-Za-z][A-Za-z0-9]+-\d+)\b/;
 const JIRA_URL_PATTERN = /https?:\/\/[^\s/]+(?:\/[^\s]*)?/i;
 const DEFAULT_JIRA_BASE_URL = "https://jira.inplatlabs.ru";
 const MAX_CHANGE_LINES_PER_MESSAGE = 40;
 
-export type MonitoringCommandAction = "register" | "unregister" | "list";
+export type MonitoringCommandAction = "register" | "unregister" | "list" | "set_interval";
 
 export interface MonitoringCommand {
   action: MonitoringCommandAction;
   epicKey?: string;
   jiraBaseUrl?: string;
+  pollIntervalMs?: number;
 }
 
 interface NormalizedIssue {
@@ -180,13 +189,18 @@ function parseJiraBaseUrl(text: string): string | undefined {
  * Returns null when the message is not a monitoring command.
  */
 export function parseMonitoringCommand(text: string): MonitoringCommand | null {
-  const normalized = text.toLowerCase();
-  if (!/монитор/.test(normalized)) {
+  const normalized = text.toLowerCase().replace(/ё/g, "е");
+  const mentionsMonitoring =
+    /монитор/.test(normalized) ||
+    /интервал/.test(normalized) ||
+    /частот/.test(normalized);
+  if (!mentionsMonitoring) {
     return null;
   }
 
   const epicKey = parseEpicKey(text);
   const jiraBaseUrl = parseJiraBaseUrl(text);
+  const pollIntervalMs = parsePollIntervalMsFromText(text);
 
   const isRemoval = /(сним|убер|останов|стоп|отключ|удал|прекрат)/.test(normalized);
   if (isRemoval && epicKey) {
@@ -198,8 +212,22 @@ export function parseMonitoringCommand(text: string): MonitoringCommand | null {
     return { action: "list" };
   }
 
+  const isIntervalChange =
+    epicKey &&
+    pollIntervalMs !== undefined &&
+    /(интервал|частот)/.test(normalized) &&
+    /(измени|поставь|сделай|установ|на\s)/.test(normalized);
+  if (isIntervalChange) {
+    return { action: "set_interval", epicKey, jiraBaseUrl, pollIntervalMs };
+  }
+
   if (epicKey) {
-    return { action: "register", epicKey, jiraBaseUrl };
+    return {
+      action: "register",
+      epicKey,
+      jiraBaseUrl,
+      pollIntervalMs: pollIntervalMs ?? getDefaultPollIntervalMs(),
+    };
   }
 
   if (isListing) {
@@ -217,9 +245,11 @@ export async function registerEpicMonitoring(
   workspaceId: string,
   epicKey: string,
   jiraBaseUrl: string,
-): Promise<{ epicSummary: string; childCount: number }> {
+  pollIntervalMs: number = getDefaultPollIntervalMs(),
+): Promise<{ epicSummary: string; childCount: number; pollIntervalMs: number }> {
   const { epic, trackedIssues } = await fetchEpicSnapshot(epicKey);
   const childCount = trackedIssues.length - 1;
+  const intervalLabel = formatPollIntervalLabel(pollIntervalMs);
 
   await upsertMonitoredEpic({
     workspaceId,
@@ -227,20 +257,42 @@ export async function registerEpicMonitoring(
     epicSummary: epic.summary,
     jiraBaseUrl,
     telegramChatId: getDefaultTelegramChatId() ?? null,
+    pollIntervalMs,
   });
   await replaceIssueStates(workspaceId, epicKey, trackedIssues);
 
   const confirmationHtml = [
     `✅ <b>${escapeTelegramHtml(epicKey)}</b> поставлен на мониторинг`,
     epic.summary ? escapeTelegramHtml(epic.summary) : "",
-    `Задач в эпике: <b>${childCount}</b>. Сообщу об изменениях статусов, новых задачах, смене исполнителя/резолюции.`,
+    `Задач в эпике: <b>${childCount}</b>. Проверка: <b>${escapeTelegramHtml(intervalLabel)}</b>.`,
+    `Уведомления: статусы, новые задачи, исполнитель/резолюция.`,
     `<a href="${issueBrowseUrl(jiraBaseUrl, epicKey)}">${issueBrowseUrl(jiraBaseUrl, epicKey)}</a>`,
   ]
     .filter(Boolean)
     .join("\n");
   await sendTelegramMessage(confirmationHtml);
 
-  return { epicSummary: epic.summary, childCount };
+  return { epicSummary: epic.summary, childCount, pollIntervalMs };
+}
+
+export async function setEpicMonitoringPollInterval(
+  workspaceId: string,
+  epicKey: string,
+  pollIntervalMs: number,
+): Promise<{ pollIntervalMs: number }> {
+  const updated = await updateMonitoredEpicPollInterval(
+    workspaceId,
+    epicKey,
+    pollIntervalMs,
+  );
+  if (!updated) {
+    throw new Error(`${epicKey} не на мониторинге — сначала поставьте эпик на мониторинг.`);
+  }
+  const intervalLabel = formatPollIntervalLabel(pollIntervalMs);
+  await sendTelegramMessage(
+    `⏱ <b>${escapeTelegramHtml(epicKey)}</b>: интервал проверки — <b>${escapeTelegramHtml(intervalLabel)}</b>.`,
+  );
+  return { pollIntervalMs };
 }
 
 export async function unregisterEpicMonitoring(
@@ -410,16 +462,12 @@ async function pollSingleEpic(epicRow: MonitoredEpicRow): Promise<number> {
   return changes.length;
 }
 
-/**
- * Polls every active monitored epic once, sending Telegram notifications for changes.
- * Returns a per-epic summary; never throws (errors are collected per epic).
- */
-export async function pollAllActiveEpics(): Promise<
-  Array<{ epicKey: string; changes: number; error?: string }>
-> {
-  const activeEpics = await listActiveMonitoredEpics();
-  const results: Array<{ epicKey: string; changes: number; error?: string }> = [];
-  for (const epicRow of activeEpics) {
+async function pollEpicRows(
+  epicRows: MonitoredEpicRow[],
+): Promise<Array<{ epicKey: string; changes: number; error?: string; skipped?: boolean }>> {
+  const results: Array<{ epicKey: string; changes: number; error?: string; skipped?: boolean }> =
+    [];
+  for (const epicRow of epicRows) {
     try {
       const changeCount = await pollSingleEpic(epicRow);
       results.push({ epicKey: epicRow.epic_key, changes: changeCount });
@@ -433,3 +481,35 @@ export async function pollAllActiveEpics(): Promise<
   }
   return results;
 }
+
+/**
+ * Polls active epics whose per-epic interval has elapsed since last_checked_at.
+ */
+export async function pollDueActiveEpics(): Promise<
+  Array<{ epicKey: string; changes: number; error?: string; skipped?: boolean }>
+> {
+  const activeEpics = await listActiveMonitoredEpics();
+  const dueEpics = activeEpics.filter((epicRow) => isEpicDueForPoll(epicRow));
+  const skippedCount = activeEpics.length - dueEpics.length;
+  const results = await pollEpicRows(dueEpics);
+  if (skippedCount > 0) {
+    for (const epicRow of activeEpics) {
+      if (!isEpicDueForPoll(epicRow)) {
+        results.push({ epicKey: epicRow.epic_key, changes: 0, skipped: true });
+      }
+    }
+  }
+  return results;
+}
+
+/**
+ * Polls every active monitored epic (ignores per-epic schedule). For manual/cron runs.
+ */
+export async function pollAllActiveEpics(): Promise<
+  Array<{ epicKey: string; changes: number; error?: string }>
+> {
+  const activeEpics = await listActiveMonitoredEpics();
+  return pollEpicRows(activeEpics);
+}
+
+export { formatPollIntervalLabel, getDefaultPollIntervalMs, resolveEpicPollIntervalMs };

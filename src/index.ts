@@ -70,12 +70,16 @@ import {
   resolveRunErrorDetailText,
 } from "./run-diagnostics.js";
 import {
+  formatPollIntervalLabel,
   getJiraBaseUrl,
+  getDefaultPollIntervalMs,
   isMonitoringEnabled,
   listEpicMonitoring,
   parseMonitoringCommand,
-  pollAllActiveEpics,
+  pollDueActiveEpics,
   registerEpicMonitoring,
+  resolveEpicPollIntervalMs,
+  setEpicMonitoringPollInterval,
   unregisterEpicMonitoring,
   type MonitoringCommand,
 } from "./monitor/jira-epic-monitor.js";
@@ -88,8 +92,8 @@ const SESSION_IDLE_DISPOSE_MS = Number.parseInt(
   10,
 );
 
-const MONITOR_POLL_MS = Number.parseInt(
-  process.env.MONITOR_POLL_MS || String(30 * 60 * 1000),
+const MONITOR_TICK_MS = Number.parseInt(
+  process.env.MONITOR_TICK_MS || String(60 * 1000),
   10,
 );
 
@@ -1447,9 +1451,29 @@ async function resolveMonitoringCommandReply(
     const lines = epics.map((epic) => {
       const summary = epic.epic_summary ? ` — ${epic.epic_summary}` : "";
       const pausedMark = epic.status === "active" ? "" : " (на паузе)";
-      return `• ${epic.epic_key}${summary}${pausedMark}`;
+      const intervalLabel = formatPollIntervalLabel(resolveEpicPollIntervalMs(epic));
+      return `• ${epic.epic_key}${summary}${pausedMark} · ${intervalLabel}`;
     });
     return `На мониторинге (${epics.length}):\n${lines.join("\n")}`;
+  }
+
+  if (command.action === "set_interval") {
+    if (!command.epicKey || command.pollIntervalMs === undefined) {
+      return "Уточните эпик и интервал, например: «измени интервал MNT-14980 на раз в сутки».";
+    }
+    try {
+      const result = await setEpicMonitoringPollInterval(
+        workspace.id,
+        command.epicKey,
+        command.pollIntervalMs,
+      );
+      const intervalLabel = formatPollIntervalLabel(result.pollIntervalMs);
+      return `Интервал для ${command.epicKey}: ${intervalLabel}. Подтверждение отправил в Telegram.`;
+    } catch (intervalError) {
+      const message =
+        intervalError instanceof Error ? intervalError.message : String(intervalError);
+      return message;
+    }
   }
 
   if (command.action === "unregister") {
@@ -1466,17 +1490,19 @@ async function resolveMonitoringCommandReply(
     return "Уточните ссылку или ключ эпика Jira (например, MNT-14980).";
   }
   const jiraBaseUrl = command.jiraBaseUrl ?? getJiraBaseUrl();
-  const pollMinutes = Math.max(1, Math.round(MONITOR_POLL_MS / 60000));
+  const pollIntervalMs = command.pollIntervalMs ?? getDefaultPollIntervalMs();
+  const intervalLabel = formatPollIntervalLabel(pollIntervalMs);
   try {
     const result = await registerEpicMonitoring(
       workspace.id,
       command.epicKey,
       jiraBaseUrl,
+      pollIntervalMs,
     );
     const summarySuffix = result.epicSummary ? ` («${result.epicSummary}»)` : "";
     return (
       `Поставил ${command.epicKey}${summarySuffix} на мониторинг: ${result.childCount} задач(и). ` +
-      `Проверяю раз в ${pollMinutes} мин и присылаю в Telegram смену статусов, новые задачи, смену исполнителя/резолюции. ` +
+      `Проверка: ${intervalLabel}. Уведомления в Telegram: статусы, новые задачи, исполнитель/резолюция. ` +
       "Подтверждение отправил в Telegram."
     );
   } catch (registerError) {
@@ -1821,12 +1847,13 @@ async function runMonitoringPollCycle(): Promise<void> {
   }
   monitoringPollInFlight = true;
   try {
-    const results = await pollAllActiveEpics();
-    const epicsWithChanges = results.filter((entry) => entry.changes > 0);
-    const failedEpics = results.filter((entry) => entry.error);
+    const results = await pollDueActiveEpics();
+    const polledEpics = results.filter((entry) => !entry.skipped);
+    const epicsWithChanges = polledEpics.filter((entry) => entry.changes > 0);
+    const failedEpics = polledEpics.filter((entry) => entry.error);
     if (epicsWithChanges.length > 0 || failedEpics.length > 0) {
       logServerMessage(
-        `monitor poll: epics=${results.length} changed=${epicsWithChanges.length} failed=${failedEpics.length}`,
+        `monitor poll: due=${polledEpics.length} changed=${epicsWithChanges.length} failed=${failedEpics.length}`,
       );
     }
     for (const failed of failedEpics) {
@@ -1846,10 +1873,13 @@ function startMonitoringScheduler(): void {
     logServerMessage("Jira monitoring: disabled (нет Telegram/Supabase/Atlassian MCP)");
     return;
   }
-  logServerMessage(`Jira monitoring: enabled (poll every ${Math.round(MONITOR_POLL_MS / 60000)} min)`);
+  const defaultIntervalLabel = formatPollIntervalLabel(getDefaultPollIntervalMs());
+  logServerMessage(
+    `Jira monitoring: enabled (tick ${Math.round(MONITOR_TICK_MS / 1000)}s, default interval ${defaultIntervalLabel})`,
+  );
   const monitoringTimer = setInterval(() => {
     void runMonitoringPollCycle();
-  }, MONITOR_POLL_MS);
+  }, MONITOR_TICK_MS);
   monitoringTimer.unref?.();
 }
 
