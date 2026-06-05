@@ -45,7 +45,7 @@ function formatClockTimeInTimezone(referenceDate: Date, timezone: string): strin
 }
 
 /**
- * Фактическая «сейчас» для календаря и формулировок «сегодня / завтра / в понедельник».
+ * Якорь «сейчас» в каждом сообщении. Для «завтра / в понедельник» — MCP ru_calendar.
  */
 export function buildCurrentDateTimeContextPrefix(): string {
   const timezone = resolveAgentTimezone();
@@ -59,7 +59,7 @@ export function buildCurrentDateTimeContextPrefix(): string {
 Часовой пояс: ${timezone}
 Сейчас: ${weekdayLabel}, ${dateLabel}, ${timeLabel}
 Календарная дата (ISO): ${isoDate}
-Для «сегодня», «завтра», «на следующей неделе», «в понедельник» — считай от этой даты, не от даты обучения модели.
+Для «завтра», «в понедельник», «на этой неделе» — вызывай MCP ru_calendar (resolve_phrase / get_calendar_context), не считай даты сам.
 
 ---
 

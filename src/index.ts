@@ -1106,7 +1106,7 @@ async function executeChatMessageCore(
     kind: "activity",
     message: "Сбор контекста и памяти…",
   });
-  const dateTimePrefix = buildCurrentDateTimeContextPrefix(userMessageText);
+  const dateTimePrefix = buildCurrentDateTimeContextPrefix();
   const stylePrefix = buildChatResponseStylePrefix(options.responseMode);
   const brainPrefix = await buildBrainContextPrefix({
     workspaceId: workspace.id,
