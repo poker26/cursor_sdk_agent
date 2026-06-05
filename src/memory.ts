@@ -31,6 +31,7 @@ export const MEMORY_BOOTSTRAP_TEMPLATE = `## Стартовый контекст
 - Почта: Exchange (+ Exchange MCP).
 - Заметки: Notion (+ MCP notion, NOTION_TOKEN на gateway).
 - Рецепты / Flora: historical-recipes (+ HISTORICAL_RECIPES_MCP_URL).
+- **Даты и рабочие дни РФ:** ru_calendar MCP — «завтра», «в понедельник», «на этой неделе»; не считай даты сам, вызывай resolve_phrase / get_calendar_context.
 - Мониторинг Jira-эпиков: «Поставь <url> на мониторинг [раз в 30 мин / раз в сутки]» → Telegram; «измени интервал MNT-… на …»; «список мониторинга».
 
 ### Стиль ответов в веб-чате cursor_sdk_agent

@@ -471,6 +471,12 @@ function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undef
     process.env.HISTORICAL_RECIPES_MCP_URL,
     process.env.HISTORICAL_RECIPES_MCP_API_KEY,
   );
+  addHttpMcpServerWithOptionalApiKey(
+    servers,
+    "ru_calendar",
+    process.env.RU_CALENDAR_MCP_URL,
+    process.env.RU_CALENDAR_MCP_API_KEY,
+  );
 
   mergeMcpServersFromJsonEnv(servers);
 
@@ -1100,7 +1106,7 @@ async function executeChatMessageCore(
     kind: "activity",
     message: "Сбор контекста и памяти…",
   });
-  const dateTimePrefix = buildCurrentDateTimeContextPrefix();
+  const dateTimePrefix = buildCurrentDateTimeContextPrefix(userMessageText);
   const stylePrefix = buildChatResponseStylePrefix(options.responseMode);
   const brainPrefix = await buildBrainContextPrefix({
     workspaceId: workspace.id,
