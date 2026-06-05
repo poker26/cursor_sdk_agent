@@ -105,10 +105,41 @@ function isEnvFlagEnabled(rawValue: string | undefined, defaultEnabled: boolean)
   return normalized !== "false" && normalized !== "0" && normalized !== "no";
 }
 
-function getUiFeatureFlags(): { showVpnIndicator: boolean; allowAttachments: boolean } {
+function getUiFeatureFlags(): {
+  showVpnIndicator: boolean;
+  allowAttachments: boolean;
+  pageTitle: string;
+  faviconUrl: string;
+  themeColor: string;
+} {
+  const faviconPreset = process.env.UI_FAVICON_PRESET?.trim().toLowerCase();
+  const customFaviconUrl = process.env.UI_FAVICON_URL?.trim();
+  const customPageTitle = process.env.UI_PAGE_TITLE?.trim();
+  const customThemeColor = process.env.UI_THEME_COLOR?.trim();
+
+  let faviconUrl = "/favicons/work.svg";
+  let themeColor = "#0b1f3a";
+
+  if (customFaviconUrl) {
+    faviconUrl = customFaviconUrl;
+  } else if (faviconPreset === "flora") {
+    faviconUrl = "/favicons/flora.svg";
+    themeColor = "#14301a";
+  } else if (faviconPreset === "work") {
+    faviconUrl = "/favicons/work.svg";
+    themeColor = "#0b1f3a";
+  }
+
+  if (customThemeColor) {
+    themeColor = customThemeColor;
+  }
+
   return {
     showVpnIndicator: isEnvFlagEnabled(process.env.UI_SHOW_VPN_INDICATOR, true),
     allowAttachments: isEnvFlagEnabled(process.env.UI_ALLOW_ATTACHMENTS, true),
+    pageTitle: customPageTitle || "Cursor Agent",
+    faviconUrl,
+    themeColor,
   };
 }
 

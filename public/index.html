@@ -4,6 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Cursor Agent</title>
+    <link id="favicon-link" rel="icon" type="image/svg+xml" href="/favicons/work.svg" />
+    <meta id="theme-color-meta" name="theme-color" content="#0b1f3a" />
     <style>
       :root {
         font-family: system-ui, -apple-system, sans-serif;
@@ -1513,6 +1515,21 @@
         const uiFlags = config.ui || {};
         uiShowVpnIndicator = uiFlags.showVpnIndicator !== false;
         uiAllowAttachments = uiFlags.allowAttachments !== false;
+        if (uiFlags.pageTitle) {
+          document.title = uiFlags.pageTitle;
+        }
+        if (uiFlags.faviconUrl) {
+          const faviconLinkElement = document.getElementById("favicon-link");
+          if (faviconLinkElement) {
+            faviconLinkElement.href = uiFlags.faviconUrl;
+          }
+        }
+        if (uiFlags.themeColor) {
+          const themeColorMetaElement = document.getElementById("theme-color-meta");
+          if (themeColorMetaElement) {
+            themeColorMetaElement.setAttribute("content", uiFlags.themeColor);
+          }
+        }
         if (!uiShowVpnIndicator && vpnIndicatorElement) {
           vpnIndicatorElement.hidden = true;
         }
