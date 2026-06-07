@@ -69,6 +69,9 @@ import { buildCurrentDateTimeContextPrefix } from "./current-datetime-context.js
 import {
   RunDiagnosticsCollector,
   resolveRunErrorDetailText,
+  isRetriableSdkStreamFailure,
+  isWriteIterableClosedFailureMessage,
+  type RunCompletionOutcome,
 } from "./run-diagnostics.js";
 import {
   formatPollIntervalLabel,
@@ -184,6 +187,7 @@ application.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 const basicAuthUser = process.env.CHAT_BASIC_USER?.trim();
 const basicAuthPassword = process.env.CHAT_BASIC_PASSWORD?.trim();
+const chatForceLocalRunByDefault = isEnvFlagEnabled(process.env.CHAT_FORCE_LOCAL_RUN, false);
 
 const workspaceAgents = new Map<string, WorkspaceAgentRecord>();
 const sessionLocks = new Map<string, SessionLockRecord>();
@@ -314,7 +318,7 @@ function isWriteIterableClosedFailure(error: unknown): boolean {
       : typeof error === "string"
         ? error
         : String(error);
-  return /WritableIterable is closed/i.test(errorMessage);
+  return isWriteIterableClosedFailureMessage(errorMessage);
 }
 
 function isStaleAgentStreamFailure(error: unknown): boolean {
@@ -990,19 +994,55 @@ interface AgentRunStreamOptions {
   shouldAbortRun: () => boolean;
   canDeliverEventsToClient: () => boolean;
   writeClientEvent?: (payload: Record<string, unknown>) => void;
+  deliverTerminalEvent?: boolean;
+}
+
+function buildRunCompletionOutcome(
+  agentRun: Run,
+  terminalResult: {
+    status: string;
+    result?: string;
+    durationMs?: number;
+  },
+  resolvedResultText: string | undefined,
+  runDiagnosticsCollector: RunDiagnosticsCollector,
+  rawErrorMessage?: string,
+): RunCompletionOutcome {
+  return {
+    status: terminalResult.status,
+    result: resolvedResultText,
+    runId: agentRun.id,
+    rawErrorMessage,
+    durationMs: terminalResult.durationMs,
+    recentCompletedToolNames: runDiagnosticsCollector.getRecentCompletedToolNames(),
+    diagnosticSummary: runDiagnosticsCollector.formatCollectedDiagnostics(),
+  };
 }
 
 async function runAgentStreamToCompletion(
   agentRun: Run,
   streamOptions: AgentRunStreamOptions,
-): Promise<{ status: string; result?: string; runId: string }> {
+): Promise<RunCompletionOutcome> {
   const runDiagnosticsCollector = new RunDiagnosticsCollector();
+  const deliverTerminalEvent = streamOptions.deliverTerminalEvent ?? true;
 
   const deliverEventToClient = (payload: Record<string, unknown>): void => {
     if (!streamOptions.canDeliverEventsToClient()) {
       return;
     }
     streamOptions.writeClientEvent?.(payload);
+  };
+
+  const deliverRunFinished = (outcome: RunCompletionOutcome): void => {
+    if (!deliverTerminalEvent) {
+      return;
+    }
+    deliverEventToClient({
+      kind: "run_finished",
+      status: outcome.status,
+      result: outcome.result,
+      runId: outcome.runId,
+    });
   };
 
   try {
@@ -1058,22 +1098,24 @@ async function runAgentStreamToCompletion(
       },
       runDiagnosticsCollector,
     );
-    deliverEventToClient({
-      kind: "run_finished",
-      status: "error",
-      result: resolvedStreamError,
-      runId: agentRun.id,
-    });
-    return { status: "error", result: resolvedStreamError, runId: agentRun.id };
+    const streamErrorOutcome = buildRunCompletionOutcome(
+      agentRun,
+      { status: "error", result: streamErrorMessage },
+      resolvedStreamError,
+      runDiagnosticsCollector,
+      streamErrorMessage,
+    );
+    deliverRunFinished(streamErrorOutcome);
+    return streamErrorOutcome;
   }
 
   if (streamOptions.shouldAbortRun()) {
-    deliverEventToClient({
-      kind: "run_finished",
+    const cancelledOutcome: RunCompletionOutcome = {
       status: "cancelled",
       runId: agentRun.id,
-    });
-    return { status: "cancelled", runId: agentRun.id };
+    };
+    deliverRunFinished(cancelledOutcome);
+    return cancelledOutcome;
   }
 
   let terminalResult: Awaited<ReturnType<Run["wait"]>>;
@@ -1092,13 +1134,15 @@ async function runAgentStreamToCompletion(
       },
       runDiagnosticsCollector,
     );
-    deliverEventToClient({
-      kind: "run_finished",
-      status: "error",
-      result: fallbackResult,
-      runId: agentRun.id,
-    });
-    return { status: "error", result: fallbackResult, runId: agentRun.id };
+    const waitErrorOutcome = buildRunCompletionOutcome(
+      agentRun,
+      { status: "error", result: waitErrorMessage },
+      fallbackResult,
+      runDiagnosticsCollector,
+      waitErrorMessage,
+    );
+    deliverRunFinished(waitErrorOutcome);
+    return waitErrorOutcome;
   }
 
   let resolvedResultText = terminalResult.result;
@@ -1112,17 +1156,15 @@ async function runAgentStreamToCompletion(
       `run ${agentRun.id} finished with error:\n${resolvedResultText}`,
     );
   }
-  deliverEventToClient({
-    kind: "run_finished",
-    status: terminalResult.status,
-    result: resolvedResultText,
-    runId: agentRun.id,
-  });
-  return {
-    status: terminalResult.status,
-    result: resolvedResultText,
-    runId: agentRun.id,
-  };
+  const terminalOutcome = buildRunCompletionOutcome(
+    agentRun,
+    terminalResult,
+    resolvedResultText,
+    runDiagnosticsCollector,
+    terminalResult.result,
+  );
+  deliverRunFinished(terminalOutcome);
+  return terminalOutcome;
 }
 
 async function streamAgentRunToClient(
@@ -1131,7 +1173,7 @@ async function streamAgentRunToClient(
   shouldAbortRun: () => boolean,
   canDeliverEventsToClient: () => boolean,
   onAssistantText: (textDelta: string) => void,
-): Promise<{ status: string; result?: string; runId: string }> {
+): Promise<RunCompletionOutcome> {
   return runAgentStreamToCompletion(agentRun, {
     onAssistantText,
     shouldAbortRun,
@@ -1142,7 +1184,7 @@ async function streamAgentRunToClient(
 
 interface ChatMessageRunResult {
   assistantText: string;
-  runOutcome: { status: string; result?: string; runId: string };
+  runOutcome: RunCompletionOutcome;
 }
 
 function prependTextToUserPayload(
@@ -1232,7 +1274,9 @@ async function executeChatMessageCore(
       ? appendTextToUserPayload(payloadWithContext, styleSuffix)
       : payloadWithContext;
 
-  const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
+  const shouldForceLocalRun =
+    options.forceLocalRun || chatForceLocalRunByDefault;
+  const sendOptions = shouldForceLocalRun ? { local: { force: true } } : undefined;
   writeClientEvent({
     kind: "activity",
     message: "Запуск агента…",
@@ -1252,7 +1296,7 @@ async function executeChatMessageCore(
   }
 
   let assistantAccumulatedText = "";
-  let runOutcome: { status: string; result?: string; runId: string };
+  let runOutcome: RunCompletionOutcome;
   try {
     runOutcome = await runAgentStreamToCompletion(agentRun, {
       onAssistantText: (textDelta) => {
@@ -1261,6 +1305,7 @@ async function executeChatMessageCore(
       shouldAbortRun: streamSink.shouldAbortRun,
       canDeliverEventsToClient: streamSink.canDeliverEventsToClient,
       writeClientEvent: streamSink.writeClientEvent,
+      deliverTerminalEvent: false,
     });
   } finally {
     if (options.sessionId) {
@@ -1270,13 +1315,18 @@ async function executeChatMessageCore(
 
   if (
     runOutcome.status === "error" &&
-    isWriteIterableClosedFailure(runOutcome.result ?? "") &&
+    isRetriableSdkStreamFailure(runOutcome) &&
     !options.alreadyRetriedForStaleStream
   ) {
     logServerMessage(
-      `workspace ${workspace.id} stale SDK stream (${runOutcome.runId}), recreating agent`,
+      `workspace ${workspace.id} retriable SDK failure (${runOutcome.runId}), recreating agent`,
     );
-    await disposeWorkspaceAgent(workspace.id, "WriteIterable closed");
+    writeClientEvent({
+      kind: "activity",
+      message:
+        "SDK прервал долгий run (StallDetector), повторяю с новым агентом…",
+    });
+    await disposeWorkspaceAgent(workspace.id, "retriable SDK stream failure");
     await clearPersistedAgentId(workspace.id);
     return executeChatMessageCore(
       workspace,
@@ -1286,10 +1336,18 @@ async function executeChatMessageCore(
       {
         ...options,
         recreateWorkspaceAgent: true,
+        forceLocalRun: true,
         alreadyRetriedForStaleStream: true,
       },
     );
   }
+
+  writeClientEvent({
+    kind: "run_finished",
+    status: runOutcome.status,
+    result: runOutcome.result,
+    runId: runOutcome.runId,
+  });
 
   const isVoiceResponseMode = options.responseMode === "voice";
   const sanitizedAssistantText = isVoiceResponseMode

@@ -9,6 +9,16 @@ export interface RunDiagnosticEvent {
   summary: string;
 }
 
+export interface RunCompletionOutcome {
+  status: string;
+  result?: string;
+  runId: string;
+  rawErrorMessage?: string;
+  durationMs?: number;
+  recentCompletedToolNames?: string[];
+  diagnosticSummary?: string;
+}
+
 export class RunDiagnosticsCollector {
   private readonly diagnosticEvents: RunDiagnosticEvent[] = [];
   private readonly recentCompletedToolNames: string[] = [];
@@ -282,19 +292,65 @@ function buildEmptySdkResultHint(
   agentRun: Run,
 ): string {
   const runIdentifier = terminalResult.id || agentRun.id;
+  const durationMs = terminalResult.durationMs;
+  const looksLikeStallAbort =
+    durationMs !== undefined && durationMs >= 420_000 && durationMs <= 900_000;
   const diagnosticEvents = [
-    "Cursor SDK завершил run со статусом error, но не передал текст result.",
+    looksLikeStallAbort
+      ? "Cursor SDK прервал run через StallDetector (~7–8 мин без активности в облачном потоке). Запрос часто можно повторить — gateway попробует автоматически."
+      : "Cursor SDK завершил run со статусом error, но не передал текст result.",
     `runId: ${runIdentifier}`,
     "Что проверить:",
     "1. Нажмите «Сбросить агента» — часто помогает после смены MCP или долгого простоя.",
     "2. Проверьте MCP (historical-recipes, ru_calendar): доступность /mcp и API-ключ.",
-    "3. Если ошибка повторяется — «WritableIterable is closed» означает обрыв потока SDK (перезагрузка вкладки, таймаут nginx, сбой MCP).",
+    "3. Для MCP-heavy запросов на Flora задайте CHAT_FORCE_LOCAL_RUN=true в .env.",
   ];
-  if (terminalResult.durationMs !== undefined) {
-    diagnosticEvents.push(`Длительность run: ${terminalResult.durationMs} мс.`);
+  if (durationMs !== undefined) {
+    diagnosticEvents.push(`Длительность run: ${durationMs} мс.`);
   }
   if (terminalResult.model?.id) {
     diagnosticEvents.push(`Модель: ${terminalResult.model.id}.`);
   }
   return diagnosticEvents.join("\n");
+}
+
+export function isWriteIterableClosedFailureMessage(errorMessage: string): boolean {
+  const trimmedMessage = errorMessage.trim();
+  if (!trimmedMessage) {
+    return false;
+  }
+  if (trimmedMessage.includes("Что проверить:")) {
+    return false;
+  }
+  return /WritableIterable is closed/i.test(trimmedMessage);
+}
+
+export function isRetriableSdkStreamFailure(outcome: RunCompletionOutcome): boolean {
+  const rawErrorMessage = outcome.rawErrorMessage?.trim() ?? "";
+  if (isWriteIterableClosedFailureMessage(rawErrorMessage)) {
+    return true;
+  }
+  if (/operation was aborted/i.test(rawErrorMessage)) {
+    return true;
+  }
+  if (/AbortError/i.test(rawErrorMessage)) {
+    return true;
+  }
+  if (outcome.status !== "error") {
+    return false;
+  }
+
+  const durationMs = outcome.durationMs ?? 0;
+  const diagnosticSummary = outcome.diagnosticSummary ?? "";
+  const onlyStatusError =
+    /\[status\] ERROR/.test(diagnosticSummary) && !/\[tool_error\]/.test(diagnosticSummary);
+  const hadRecentMcpCalls = (outcome.recentCompletedToolNames ?? []).some(
+    (toolName) => toolName === "mcp",
+  );
+
+  if (durationMs >= 420_000 && onlyStatusError && hadRecentMcpCalls) {
+    return true;
+  }
+
+  return onlyStatusError && hadRecentMcpCalls && !outcome.result?.trim();
 }
