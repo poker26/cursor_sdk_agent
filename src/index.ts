@@ -42,6 +42,7 @@ import {
 import {
   clearPersistedAgentId,
   loadPersistedAgentId,
+  loadPersistedMcpFingerprint,
   loadPersistedModelId,
   savePersistedAgentId,
 } from "./workspace-state.js";
@@ -516,6 +517,14 @@ function buildMcpServersConfiguration(): Record<string, McpServerConfig> | undef
   return Object.keys(servers).length > 0 ? servers : undefined;
 }
 
+function buildMcpServerFingerprint(): string {
+  const configuredMcpServers = buildMcpServersConfiguration();
+  if (!configuredMcpServers) {
+    return "";
+  }
+  return Object.keys(configuredMcpServers).sort().join(",");
+}
+
 function resolveNpxCommandPath(): string {
   const configuredPath = process.env.NOTION_MCP_NPX_PATH?.trim();
   if (configuredPath) {
@@ -724,14 +733,23 @@ async function resumeOrCreateWorkspaceAgent(
 ): Promise<SDKAgent> {
   const persistedAgentId = await loadPersistedAgentId(workspace.id);
   const persistedModelId = await loadPersistedModelId(workspace.id);
+  const persistedMcpFingerprint = await loadPersistedMcpFingerprint(workspace.id);
+  const currentMcpFingerprint = buildMcpServerFingerprint();
   const canResumePersistedAgent =
     Boolean(persistedAgentId) &&
-    (!persistedModelId || persistedModelId === modelId);
+    (!persistedModelId || persistedModelId === modelId) &&
+    (!persistedMcpFingerprint || persistedMcpFingerprint === currentMcpFingerprint);
 
   if (persistedAgentId && !canResumePersistedAgent) {
-    logServerMessage(
-      `workspace ${workspace.id} skip resume: model ${persistedModelId ?? "?"} → ${modelId}`,
-    );
+    if (persistedModelId && persistedModelId !== modelId) {
+      logServerMessage(
+        `workspace ${workspace.id} skip resume: model ${persistedModelId ?? "?"} → ${modelId}`,
+      );
+    } else if (persistedMcpFingerprint !== currentMcpFingerprint) {
+      logServerMessage(
+        `workspace ${workspace.id} skip resume: MCP changed (${persistedMcpFingerprint ?? "none"} → ${currentMcpFingerprint || "none"})`,
+      );
+    }
     await clearPersistedAgentId(workspace.id);
   }
 
@@ -879,7 +897,7 @@ async function getOrCreateWorkspaceAgent(
   }
 
   const agent = await resumeOrCreateWorkspaceAgent(workspace, modelId);
-  await savePersistedAgentId(workspace.id, agent.agentId, modelId);
+  await savePersistedAgentId(workspace.id, agent.agentId, modelId, buildMcpServerFingerprint());
 
   const workspaceRecord: WorkspaceAgentRecord = {
     agent,
@@ -965,36 +983,68 @@ async function runAgentStreamToCompletion(
 ): Promise<{ status: string; result?: string; runId: string }> {
   const runDiagnosticsCollector = new RunDiagnosticsCollector();
 
-  for await (const streamMessage of agentRun.stream()) {
-    if (!streamOptions.shouldContinue()) {
-      if (agentRun.supports("cancel")) {
-        try {
-          await agentRun.cancel();
-        } catch (cancelError) {
-          logServerMessage(
-            `cancel after disconnect: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
-          );
+  try {
+    for await (const streamMessage of agentRun.stream()) {
+      if (!streamOptions.shouldContinue()) {
+        if (agentRun.supports("cancel")) {
+          try {
+            await agentRun.cancel();
+          } catch (cancelError) {
+            logServerMessage(
+              `cancel after disconnect: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
+            );
+          }
+        }
+        break;
+      }
+      if (streamMessage.type === "assistant") {
+        const textDelta = extractAssistantTextDelta(streamMessage);
+        if (textDelta) {
+          streamOptions.onAssistantText(textDelta);
         }
       }
-      break;
-    }
-    if (streamMessage.type === "assistant") {
-      const textDelta = extractAssistantTextDelta(streamMessage);
-      if (textDelta) {
-        streamOptions.onAssistantText(textDelta);
+      try {
+        runDiagnosticsCollector.observeStreamMessage(streamMessage);
+      } catch (diagnosticsObserveError) {
+        logServerMessage(
+          `run diagnostics observe skipped: ${diagnosticsObserveError instanceof Error ? diagnosticsObserveError.message : String(diagnosticsObserveError)}`,
+        );
+      }
+      const clientPayload = describeStreamMessageForClient(streamMessage);
+      if (clientPayload && streamOptions.writeClientEvent) {
+        streamOptions.writeClientEvent(clientPayload);
       }
     }
-    try {
-      runDiagnosticsCollector.observeStreamMessage(streamMessage);
-    } catch (diagnosticsObserveError) {
-      logServerMessage(
-        `run diagnostics observe skipped: ${diagnosticsObserveError instanceof Error ? diagnosticsObserveError.message : String(diagnosticsObserveError)}`,
-      );
+  } catch (streamError) {
+    const streamErrorMessage =
+      streamError instanceof Error ? streamError.message : String(streamError);
+    logServerMessage(`run ${agentRun.id} stream() failed: ${streamErrorMessage}`);
+    runDiagnosticsCollector.observeExternalError(streamErrorMessage);
+    if (agentRun.supports("cancel")) {
+      try {
+        await agentRun.cancel();
+      } catch {
+        /* ignore */
+      }
     }
-    const clientPayload = describeStreamMessageForClient(streamMessage);
-    if (clientPayload && streamOptions.writeClientEvent) {
-      streamOptions.writeClientEvent(clientPayload);
+    const resolvedStreamError = await resolveRunErrorDetailText(
+      agentRun,
+      {
+        id: agentRun.id,
+        status: "error",
+        result: streamErrorMessage,
+      },
+      runDiagnosticsCollector,
+    );
+    if (streamOptions.writeClientEvent) {
+      streamOptions.writeClientEvent({
+        kind: "run_finished",
+        status: "error",
+        result: resolvedStreamError,
+        runId: agentRun.id,
+      });
     }
+    return { status: "error", result: resolvedStreamError, runId: agentRun.id };
   }
 
   if (!streamOptions.shouldContinue()) {

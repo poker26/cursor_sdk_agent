@@ -4,11 +4,6 @@ import type { SDKMessage, SDKToolUseMessage } from "@cursor/sdk";
 const MAX_DIAGNOSTIC_EVENTS = 24;
 const MAX_SNIPPET_CHARS = 900;
 
-function isConversationDiagnosticsEnabled(): boolean {
-  const rawValue = process.env.RUN_DIAGNOSTICS_USE_CONVERSATION?.trim().toLowerCase();
-  return rawValue === "true" || rawValue === "1";
-}
-
 export interface RunDiagnosticEvent {
   kind: string;
   summary: string;
@@ -85,6 +80,10 @@ export class RunDiagnosticsCollector {
     return [...this.diagnosticEvents];
   }
 
+  observeExternalError(errorMessage: string): void {
+    this.pushDiagnosticEvent("stream_error", errorMessage);
+  }
+
   formatCollectedDiagnostics(): string | undefined {
     if (this.diagnosticEvents.length === 0) {
       return undefined;
@@ -126,19 +125,15 @@ export async function resolveRunErrorDetailText(
       }
     }
 
-    if (isConversationDiagnosticsEnabled()) {
-      const fromConversation = await tryExtractErrorDetailFromConversation(agentRun);
-      if (fromConversation) {
-        return fromConversation;
-      }
+    const fromConversation = await tryExtractErrorDetailFromConversation(agentRun);
+    if (fromConversation) {
+      return fromConversation;
     }
 
     const fromStreamDiagnostics = diagnosticsCollector.formatCollectedDiagnostics();
     if (fromStreamDiagnostics) {
-      return [
-        "SDK не вернул текст ошибки (result пустой). По событиям run:",
-        fromStreamDiagnostics,
-      ].join("\n");
+      const emptyResultHint = buildEmptySdkResultHint(terminalResult, agentRun);
+      return [emptyResultHint, fromStreamDiagnostics].join("\n");
     }
 
     const durationHint =
@@ -280,4 +275,26 @@ function truncateDiagnosticText(text: string, maxLength = MAX_SNIPPET_CHARS): st
     return trimmed;
   }
   return `${trimmed.slice(0, maxLength)}…`;
+}
+
+function buildEmptySdkResultHint(
+  terminalResult: RunResult,
+  agentRun: Run,
+): string {
+  const runIdentifier = terminalResult.id || agentRun.id;
+  const diagnosticEvents = [
+    "Cursor SDK завершил run со статусом error, но не передал текст result.",
+    `runId: ${runIdentifier}`,
+    "Что проверить:",
+    "1. Нажмите «Сбросить агента» — часто помогает после смены MCP или долгого простоя.",
+    "2. Проверьте MCP (historical-recipes, ru_calendar): доступность /mcp и API-ключ.",
+    "3. Если ошибка повторяется — «WritableIterable is closed» означает обрыв потока SDK (перезагрузка вкладки, таймаут nginx, сбой MCP).",
+  ];
+  if (terminalResult.durationMs !== undefined) {
+    diagnosticEvents.push(`Длительность run: ${terminalResult.durationMs} мс.`);
+  }
+  if (terminalResult.model?.id) {
+    diagnosticEvents.push(`Модель: ${terminalResult.model.id}.`);
+  }
+  return diagnosticEvents.join("\n");
 }

@@ -9,6 +9,7 @@ const workspaceStateFilePath = path.join(dataDirectoryPath, "workspace-state.jso
 export interface WorkspacePersistedState {
   agentId: string;
   modelId?: string;
+  mcpFingerprint?: string;
   updatedAt: string;
 }
 
@@ -61,10 +62,24 @@ export async function loadPersistedModelId(
   return typeof modelId === "string" && modelId.trim() ? modelId.trim() : undefined;
 }
 
+export async function loadPersistedMcpFingerprint(
+  workspaceId: string,
+): Promise<string | undefined> {
+  if (!isPersistAgentIdEnabled()) {
+    return undefined;
+  }
+  const stateFile = await readWorkspaceStateFile();
+  const mcpFingerprint = stateFile.workspaces[workspaceId]?.mcpFingerprint;
+  return typeof mcpFingerprint === "string" && mcpFingerprint.trim()
+    ? mcpFingerprint.trim()
+    : undefined;
+}
+
 export async function savePersistedAgentId(
   workspaceId: string,
   agentId: string,
   modelId?: string,
+  mcpFingerprint?: string,
 ): Promise<void> {
   if (!isPersistAgentIdEnabled()) {
     return;
@@ -74,6 +89,7 @@ export async function savePersistedAgentId(
   stateFile.workspaces[workspaceId] = {
     agentId,
     modelId: modelId?.trim() || previous?.modelId,
+    mcpFingerprint: mcpFingerprint?.trim() || previous?.mcpFingerprint,
     updatedAt: new Date().toISOString(),
   };
   await writeWorkspaceStateFile(stateFile);
