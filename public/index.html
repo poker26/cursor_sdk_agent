@@ -1213,7 +1213,11 @@
 
       function formatServerStatusLabel(statusValue, statusMessage) {
         if (statusMessage && String(statusMessage).trim()) {
-          return String(statusMessage).trim();
+          const normalizedMessage = String(statusMessage).trim();
+          if (/^404\b/.test(normalizedMessage) || normalizedMessage === "404") {
+            return "Сессия агента недоступна (404). Нажмите «Сбросить агента» и повторите.";
+          }
+          return normalizedMessage;
         }
         const normalizedStatus = String(statusValue || "").trim().toUpperCase();
         const statusLabels = {
@@ -1691,6 +1695,8 @@
         let lastResponseElapsedMs = null;
         let voiceRunErrorDetail = null;
         let chatWasCancelledByUser = false;
+        let runFinishedReceived = false;
+        let finalActivityStatus = null;
         const responseStartedAtMs = performance.now();
 
         const attachmentSnapshot = pendingAttachments.slice();
@@ -1802,6 +1808,8 @@
             scrollMessagesToBottom();
             saveHistoryToStorage();
           } else if (event.kind === "run_finished") {
+            runFinishedReceived = true;
+            finalActivityStatus = event.status;
             finalizeAgentActivityPanel(event.status);
             lastRunSucceeded = event.status !== "error" && event.status !== "cancelled";
             lastResponseElapsedMs = performance.now() - responseStartedAtMs;
@@ -1896,6 +1904,16 @@
           lastResponseElapsedMs = performance.now() - responseStartedAtMs;
         }
 
+        if (!chatWasCancelledByUser && !runFinishedReceived) {
+          const incompleteStreamMessage =
+            "Соединение с сервером оборвалось до завершения ответа. " +
+            "Если в облачке было «404» — нажмите «Сбросить агента» и отправьте запрос снова.";
+          voiceRunErrorDetail = incompleteStreamMessage;
+          appendMessageBubble("error", incompleteStreamMessage);
+          setStatus("ошибка", "error", lastResponseElapsedMs);
+          saveHistoryToStorage();
+        }
+
         if (!chatWasCancelledByUser) {
           applyChatResponseTiming(lastResponseElapsedMs, agentBubbleForAutoSpeech);
 
@@ -1904,14 +1922,20 @@
           } else if (voiceRunErrorDetail && replyWithSpeechAfterRun && voiceEnabled) {
             await playVoiceBriefNotice(resolveVoiceErrorBriefSpeech(voiceRunErrorDetail));
           }
-          if (statusPillElement.className !== "error" && !activeSpeakButtonElement) {
+          if (
+            statusPillElement.className !== "error" &&
+            !activeSpeakButtonElement &&
+            (runFinishedReceived || chatWasCancelledByUser)
+          ) {
             setStatus("готов", "", lastResponseElapsedMs);
           }
         }
 
         } finally {
           if (agentActivityTracking) {
-            finalizeAgentActivityPanel("cancelled");
+            finalizeAgentActivityPanel(
+              chatWasCancelledByUser ? "cancelled" : finalActivityStatus || "error",
+            );
           }
           isRequestInFlight = false;
           chatAbortController = null;

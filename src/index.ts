@@ -307,6 +307,20 @@ function isAgentBusyFailure(error: unknown): boolean {
   return /already has active run/i.test(errorMessage);
 }
 
+function isWriteIterableClosedFailure(error: unknown): boolean {
+  const errorMessage =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : String(error);
+  return /WritableIterable is closed/i.test(errorMessage);
+}
+
+function isStaleAgentStreamFailure(error: unknown): boolean {
+  return isWriteIterableClosedFailure(error) || isAuthenticationFailure(error);
+}
+
 function clearSessionLocksForWorkspace(workspaceId: string): number {
   let clearedCount = 0;
   for (const [sessionId, sessionLock] of sessionLocks.entries()) {
@@ -973,7 +987,8 @@ function describeStreamMessageForClient(message: SDKMessage): Record<string, unk
 
 interface AgentRunStreamOptions {
   onAssistantText: (textDelta: string) => void;
-  shouldContinue: () => boolean;
+  shouldAbortRun: () => boolean;
+  canDeliverEventsToClient: () => boolean;
   writeClientEvent?: (payload: Record<string, unknown>) => void;
 }
 
@@ -983,15 +998,22 @@ async function runAgentStreamToCompletion(
 ): Promise<{ status: string; result?: string; runId: string }> {
   const runDiagnosticsCollector = new RunDiagnosticsCollector();
 
+  const deliverEventToClient = (payload: Record<string, unknown>): void => {
+    if (!streamOptions.canDeliverEventsToClient()) {
+      return;
+    }
+    streamOptions.writeClientEvent?.(payload);
+  };
+
   try {
     for await (const streamMessage of agentRun.stream()) {
-      if (!streamOptions.shouldContinue()) {
+      if (streamOptions.shouldAbortRun()) {
         if (agentRun.supports("cancel")) {
           try {
             await agentRun.cancel();
           } catch (cancelError) {
             logServerMessage(
-              `cancel after disconnect: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
+              `chat cancel run ${agentRun.id}: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
             );
           }
         }
@@ -1011,8 +1033,8 @@ async function runAgentStreamToCompletion(
         );
       }
       const clientPayload = describeStreamMessageForClient(streamMessage);
-      if (clientPayload && streamOptions.writeClientEvent) {
-        streamOptions.writeClientEvent(clientPayload);
+      if (clientPayload) {
+        deliverEventToClient(clientPayload);
       }
     }
   } catch (streamError) {
@@ -1036,25 +1058,21 @@ async function runAgentStreamToCompletion(
       },
       runDiagnosticsCollector,
     );
-    if (streamOptions.writeClientEvent) {
-      streamOptions.writeClientEvent({
-        kind: "run_finished",
-        status: "error",
-        result: resolvedStreamError,
-        runId: agentRun.id,
-      });
-    }
+    deliverEventToClient({
+      kind: "run_finished",
+      status: "error",
+      result: resolvedStreamError,
+      runId: agentRun.id,
+    });
     return { status: "error", result: resolvedStreamError, runId: agentRun.id };
   }
 
-  if (!streamOptions.shouldContinue()) {
-    if (streamOptions.writeClientEvent) {
-      streamOptions.writeClientEvent({
-        kind: "run_finished",
-        status: "cancelled",
-        runId: agentRun.id,
-      });
-    }
+  if (streamOptions.shouldAbortRun()) {
+    deliverEventToClient({
+      kind: "run_finished",
+      status: "cancelled",
+      runId: agentRun.id,
+    });
     return { status: "cancelled", runId: agentRun.id };
   }
 
@@ -1074,14 +1092,12 @@ async function runAgentStreamToCompletion(
       },
       runDiagnosticsCollector,
     );
-    if (streamOptions.writeClientEvent) {
-      streamOptions.writeClientEvent({
-        kind: "run_finished",
-        status: "error",
-        result: fallbackResult,
-        runId: agentRun.id,
-      });
-    }
+    deliverEventToClient({
+      kind: "run_finished",
+      status: "error",
+      result: fallbackResult,
+      runId: agentRun.id,
+    });
     return { status: "error", result: fallbackResult, runId: agentRun.id };
   }
 
@@ -1096,14 +1112,12 @@ async function runAgentStreamToCompletion(
       `run ${agentRun.id} finished with error:\n${resolvedResultText}`,
     );
   }
-  if (streamOptions.writeClientEvent) {
-    streamOptions.writeClientEvent({
-      kind: "run_finished",
-      status: terminalResult.status,
-      result: resolvedResultText,
-      runId: agentRun.id,
-    });
-  }
+  deliverEventToClient({
+    kind: "run_finished",
+    status: terminalResult.status,
+    result: resolvedResultText,
+    runId: agentRun.id,
+  });
   return {
     status: terminalResult.status,
     result: resolvedResultText,
@@ -1114,12 +1128,14 @@ async function runAgentStreamToCompletion(
 async function streamAgentRunToClient(
   agentRun: Run,
   response: express.Response,
-  isClientStillConnected: () => boolean,
+  shouldAbortRun: () => boolean,
+  canDeliverEventsToClient: () => boolean,
   onAssistantText: (textDelta: string) => void,
 ): Promise<{ status: string; result?: string; runId: string }> {
   return runAgentStreamToCompletion(agentRun, {
     onAssistantText,
-    shouldContinue: isClientStillConnected,
+    shouldAbortRun,
+    canDeliverEventsToClient,
     writeClientEvent: (payload) => writeSseDataLine(response, payload),
   });
 }
@@ -1166,7 +1182,8 @@ async function executeChatMessageCore(
   userMessagePayload: string | SDKUserMessage,
   userMessageText: string,
   streamSink: {
-    shouldContinue: () => boolean;
+    shouldAbortRun: () => boolean;
+    canDeliverEventsToClient: () => boolean;
     writeClientEvent?: (payload: Record<string, unknown>) => void;
   },
   options: {
@@ -1175,6 +1192,7 @@ async function executeChatMessageCore(
     responseMode: ChatResponseMode;
     modelId: string;
     sessionId?: string;
+    alreadyRetriedForStaleStream?: boolean;
   },
 ): Promise<ChatMessageRunResult> {
   if (options.recreateWorkspaceAgent) {
@@ -1182,8 +1200,15 @@ async function executeChatMessageCore(
     await clearPersistedAgentId(workspace.id);
   }
 
+  const writeClientEvent = (payload: Record<string, unknown>): void => {
+    if (!streamSink.canDeliverEventsToClient()) {
+      return;
+    }
+    streamSink.writeClientEvent?.(payload);
+  };
+
   const workspaceRecord = await getOrCreateWorkspaceAgent(workspace, options.modelId);
-  streamSink.writeClientEvent?.({
+  writeClientEvent({
     kind: "activity",
     message: "Сбор контекста и памяти…",
   });
@@ -1208,12 +1233,12 @@ async function executeChatMessageCore(
       : payloadWithContext;
 
   const sendOptions = options.forceLocalRun ? { local: { force: true } } : undefined;
-  streamSink.writeClientEvent?.({
+  writeClientEvent({
     kind: "activity",
     message: "Запуск агента…",
   });
   const agentRun = await workspaceRecord.agent.send(payloadWithBrain, sendOptions);
-  streamSink.writeClientEvent?.({
+  writeClientEvent({
     kind: "activity",
     message: "Агент выполняет задачу…",
     runId: agentRun.id,
@@ -1233,13 +1258,37 @@ async function executeChatMessageCore(
       onAssistantText: (textDelta) => {
         assistantAccumulatedText += textDelta;
       },
-      shouldContinue: streamSink.shouldContinue,
+      shouldAbortRun: streamSink.shouldAbortRun,
+      canDeliverEventsToClient: streamSink.canDeliverEventsToClient,
       writeClientEvent: streamSink.writeClientEvent,
     });
   } finally {
     if (options.sessionId) {
       activeChatRunsBySession.delete(options.sessionId);
     }
+  }
+
+  if (
+    runOutcome.status === "error" &&
+    isWriteIterableClosedFailure(runOutcome.result ?? "") &&
+    !options.alreadyRetriedForStaleStream
+  ) {
+    logServerMessage(
+      `workspace ${workspace.id} stale SDK stream (${runOutcome.runId}), recreating agent`,
+    );
+    await disposeWorkspaceAgent(workspace.id, "WriteIterable closed");
+    await clearPersistedAgentId(workspace.id);
+    return executeChatMessageCore(
+      workspace,
+      userMessagePayload,
+      userMessageText,
+      streamSink,
+      {
+        ...options,
+        recreateWorkspaceAgent: true,
+        alreadyRetriedForStaleStream: true,
+      },
+    );
   }
 
   const isVoiceResponseMode = options.responseMode === "voice";
@@ -1250,16 +1299,16 @@ async function executeChatMessageCore(
     isVoiceResponseMode &&
     sanitizedAssistantText &&
     sanitizedAssistantText !== assistantAccumulatedText &&
-    streamSink.shouldContinue() &&
+    streamSink.canDeliverEventsToClient() &&
     streamSink.writeClientEvent
   ) {
-    streamSink.writeClientEvent({
+    writeClientEvent({
       kind: "assistant_text_final",
       text: sanitizedAssistantText,
     });
   }
 
-  if (runOutcome.status !== "error" && streamSink.shouldContinue()) {
+  if (runOutcome.status !== "error") {
     try {
       await persistBrainAfterRun({
         workspaceId: workspace.id,
@@ -1285,7 +1334,10 @@ async function executeChatMessageForWorkspace(
   userMessagePayload: string | SDKUserMessage,
   userMessageText: string,
   response: express.Response,
-  isClientStillConnected: () => boolean,
+  streamControl: {
+    shouldAbortRun: () => boolean;
+    canDeliverEventsToClient: () => boolean;
+  },
   options: {
     forceLocalRun: boolean;
     recreateWorkspaceAgent: boolean;
@@ -1298,7 +1350,8 @@ async function executeChatMessageForWorkspace(
     userMessagePayload,
     userMessageText,
     {
-      shouldContinue: isClientStillConnected,
+      shouldAbortRun: streamControl.shouldAbortRun,
+      canDeliverEventsToClient: streamControl.canDeliverEventsToClient,
       writeClientEvent: (payload) => writeSseDataLine(response, payload),
     },
     { ...options, sessionId },
@@ -1326,7 +1379,8 @@ async function runChatTurnWithRetry(
   responseMode: ChatResponseMode,
   modelId: string,
   streamSink: {
-    shouldContinue: () => boolean;
+    shouldAbortRun: () => boolean;
+    canDeliverEventsToClient: () => boolean;
     writeClientEvent?: (payload: Record<string, unknown>) => void;
   },
 ): Promise<ChatMessageRunResult> {
@@ -1348,7 +1402,7 @@ async function runChatTurnWithRetry(
     const normalizedError = normalizeThrownError(firstAttemptError);
     const agentIsBusy = isAgentBusyFailure(firstAttemptError);
     const shouldRecreateWorkspaceAgent =
-      isAuthenticationFailure(firstAttemptError) || agentIsBusy;
+      isStaleAgentStreamFailure(firstAttemptError) || agentIsBusy;
     const shouldForceLocalRun = agentIsBusy || shouldRecreateWorkspaceAgent;
 
     if (!shouldRecreateWorkspaceAgent && !shouldForceLocalRun) {
@@ -1363,7 +1417,7 @@ async function runChatTurnWithRetry(
       `workspace ${workspace.id} retry: recreate=${shouldRecreateWorkspaceAgent} force=${shouldForceLocalRun} (${normalizedError.message})`,
     );
 
-    if (!streamSink.shouldContinue()) {
+    if (streamSink.shouldAbortRun()) {
       throw normalizedError;
     }
 
@@ -1479,11 +1533,12 @@ registerVoiceTurnRoute(application, {
       responseMode,
       modelId,
       {
-        shouldContinue: () => true,
+        shouldAbortRun: () => false,
+        canDeliverEventsToClient: () => true,
       },
     ),
   recoverWorkspaceAfterFailure: async (workspaceId, reason, error) => {
-    if (isAuthenticationFailure(error)) {
+    if (isStaleAgentStreamFailure(error)) {
       await recoverStuckWorkspaceAgent(workspaceId, reason);
     } else if (isAgentBusyFailure(error)) {
       await recoverStuckWorkspaceAgent(workspaceId, reason);
@@ -1729,15 +1784,21 @@ application.post("/api/chat", async (request, response) => {
 
   let clientStillConnected = true;
   request.on("close", () => {
+    if (clientStillConnected) {
+      logServerMessage(
+        `session ${sessionId} client disconnected (agent run continues until finish or explicit cancel)`,
+      );
+    }
     clientStillConnected = false;
   });
 
-  const isClientStillConnected = (): boolean =>
-    clientStillConnected && !response.writableEnded && !cancelledChatSessions.has(sessionId);
+  const shouldAbortRun = (): boolean => cancelledChatSessions.has(sessionId);
+  const canDeliverEventsToClient = (): boolean =>
+    clientStillConnected && !response.writableEnded;
 
   const chatRunStartedAtMs = Date.now();
   const activityHeartbeatTimer = setInterval(() => {
-    if (!isClientStillConnected()) {
+    if (!canDeliverEventsToClient()) {
       return;
     }
     writeSseDataLine(response, {
@@ -1745,6 +1806,11 @@ application.post("/api/chat", async (request, response) => {
       elapsedMs: Date.now() - chatRunStartedAtMs,
     });
   }, 12000);
+
+  const chatStreamControl = {
+    shouldAbortRun,
+    canDeliverEventsToClient,
+  };
 
   try {
     try {
@@ -1754,7 +1820,7 @@ application.post("/api/chat", async (request, response) => {
         userMessagePayload,
         userMessageText,
         response,
-        isClientStillConnected,
+        chatStreamControl,
         {
           forceLocalRun: false,
           recreateWorkspaceAgent: false,
@@ -1766,25 +1832,29 @@ application.post("/api/chat", async (request, response) => {
       const normalizedError = normalizeThrownError(firstAttemptError);
       const agentIsBusy = isAgentBusyFailure(firstAttemptError);
       const shouldRecreateWorkspaceAgent =
-        isAuthenticationFailure(firstAttemptError) || agentIsBusy;
+        isStaleAgentStreamFailure(firstAttemptError) || agentIsBusy;
       const shouldForceLocalRun = agentIsBusy || shouldRecreateWorkspaceAgent;
 
       if (!shouldRecreateWorkspaceAgent && !shouldForceLocalRun) {
         throw normalizedError;
       }
 
-      if (agentIsBusy) {
+      if (agentIsBusy || isWriteIterableClosedFailure(firstAttemptError)) {
         await recoverStuckWorkspaceAgent(
           workspace.id,
-          "active run conflict before retry",
+          isWriteIterableClosedFailure(firstAttemptError)
+            ? "WriteIterable closed before retry"
+            : "active run conflict before retry",
         );
+      } else if (isAuthenticationFailure(firstAttemptError)) {
+        await recoverStuckWorkspaceAgent(workspace.id, "authentication failure before retry");
       }
 
       logServerMessage(
         `workspace ${workspace.id} retry: recreate=${shouldRecreateWorkspaceAgent} force=${shouldForceLocalRun} (${normalizedError.message})`,
       );
 
-      if (!isClientStillConnected()) {
+      if (!canDeliverEventsToClient()) {
         return;
       }
 
@@ -1794,7 +1864,7 @@ application.post("/api/chat", async (request, response) => {
         userMessagePayload,
         userMessageText,
         response,
-        isClientStillConnected,
+        chatStreamControl,
         {
           forceLocalRun: shouldForceLocalRun || shouldRecreateWorkspaceAgent,
           recreateWorkspaceAgent: shouldRecreateWorkspaceAgent,
@@ -1804,18 +1874,23 @@ application.post("/api/chat", async (request, response) => {
       );
     }
 
-    if (isClientStillConnected()) {
+    if (canDeliverEventsToClient()) {
       response.end();
     }
   } catch (error) {
     const normalizedError = normalizeThrownError(error);
-    if (isAuthenticationFailure(error)) {
-      await recoverStuckWorkspaceAgent(workspace.id, "authentication failure");
+    if (isStaleAgentStreamFailure(error)) {
+      await recoverStuckWorkspaceAgent(
+        workspace.id,
+        isWriteIterableClosedFailure(error)
+          ? "WriteIterable closed"
+          : "authentication failure",
+      );
     } else if (isAgentBusyFailure(error)) {
       await recoverStuckWorkspaceAgent(workspace.id, "active run conflict after retry");
     }
     logServerMessage(`session ${sessionId} chat failed: ${normalizedError.message}`);
-    if (isClientStillConnected()) {
+    if (canDeliverEventsToClient()) {
       const cursorAgentError = normalizedError instanceof CursorAgentError ? normalizedError : undefined;
       writeSseDataLine(response, {
         kind: "error",
@@ -2007,10 +2082,15 @@ process.on("unhandledRejection", (reason) => {
   logServerMessage(
     `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`,
   );
-  if (isAuthenticationFailure(reason)) {
+  if (isStaleAgentStreamFailure(reason)) {
     const workspaceIds = [...workspaceAgents.keys()];
     for (const workspaceId of workspaceIds) {
-      void disposeWorkspaceAgent(workspaceId, "unhandled auth rejection");
+      void disposeWorkspaceAgent(
+        workspaceId,
+        isWriteIterableClosedFailure(reason)
+          ? "unhandled WriteIterable closed"
+          : "unhandled auth rejection",
+      );
       void clearPersistedAgentId(workspaceId);
     }
   }
